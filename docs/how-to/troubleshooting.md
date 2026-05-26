@@ -25,6 +25,29 @@ $ untether doctor
 <!-- TODO: capture screenshot -->
 <!-- <img src="../assets/screenshots/doctor-output.jpg" alt="untether doctor output showing check results" width="360" loading="lazy" /> -->
 
+## Bot fails to start: `allowed_user_ids is empty`
+
+**Symptoms:** Untether exits at startup with `ConfigError: [transports.telegram] allowed_user_ids is empty …`.
+
+This is the v0.35.3 ([#377](https://github.com/littlebearapps/untether/issues/377)) startup-block. Before v0.35.3 an empty allowlist was a silent insecure default — any Telegram user who knew the bot username could send commands. Fix by either:
+
+- **Recommended**: populate the allowlist with your Telegram user ID(s):
+
+    ```sh
+    untether config set transports.telegram.allowed_user_ids "[<your_id>]"
+    ```
+
+    Get your ID with `untether chat-id` (sends a message in your chat and prints the IDs).
+
+- **Dev/demo escape hatch**: opt in to an open bot. Logged at INFO every boot so the deviation stays visible:
+
+    ```toml title="~/.untether/untether.toml"
+    [transports.telegram]
+    allow_any_user = true
+    ```
+
+See [security.md](security.md#restrict-access) for the full discussion.
+
 ## Bot not responding
 
 **Symptoms:** You send a message but the bot doesn't reply at all.
@@ -33,8 +56,8 @@ $ untether doctor
     - **Terminal**: Look at the terminal where you ran `untether` — is it still running?
     - **Linux (systemd)**: `systemctl --user status untether`
 2. Verify your bot token: `untether doctor` will flag an invalid token
-3. Check `allowed_user_ids` — if set, only listed users can interact. An empty list means everyone is allowed.
-4. In a group chat, check trigger mode: if set to `mentions`, you must @mention the bot
+3. Check `allowed_user_ids` — only listed users can interact. As of v0.35.3, an empty list is rejected at startup unless `allow_any_user = true` is set ([#377](https://github.com/littlebearapps/untether/issues/377)).
+4. In a group chat, check listen mode (`/listen`): if set to `mentions`, you must @mention the bot
 5. Make sure you're messaging the correct bot (not a different one)
 
 ## Engine CLI not found
@@ -166,6 +189,46 @@ This is an upstream Claude Code bug ([#34142](https://github.com/anthropics/clau
 3. Increase max retries if a single retry isn't enough: set `max_retries = 2` (max 5)
 
 **Auto-continue is suppressed for signal deaths** (rc=143/SIGTERM, rc=137/SIGKILL) to prevent death spirals under memory pressure. See the [config reference](../reference/config.md#auto_continue).
+
+## "Stream idle timeout - partial response received" (Claude)
+
+**Symptoms:** Claude Code fails with `API Error: Stream idle timeout - partial response received` mid-run, with a Type-A or Type-B classification appended to the failure message.
+
+The error message is classified inline ([#438](https://github.com/littlebearapps/untether/issues/438)) so you don't have to guess which mitigation applies:
+
+* **Type-A (mid-generation stall)** — `num_turns ≥ 1 && duration_api_ms > 0`. Anthropic SSE went silent partway through a generation. Common on long opus 4.7 1M plan-mode runs. **Mitigation:** raise `[watchdog] claude_stream_idle_timeout_ms` to ride out longer silences.
+  ```toml
+  [watchdog]
+  claude_stream_idle_timeout_ms = 600000   # 10 min (default 300000 / 5 min; max 1800000 / 30 min)
+  ```
+  Shell-set `CLAUDE_STREAM_IDLE_TIMEOUT_MS` still wins.
+* **Type-B (cold-start zero-byte stall)** — `num_turns ≤ 1 && duration_api_ms == 0`. The connection opened and went silent before Anthropic produced any tokens. This is an upstream API outage, **not** a watchdog miscalibration — raising the timeout will not help. Wait it out, retry, or check the [Anthropic status page](https://status.anthropic.com).
+
+Auto-retry for Type-A is deferred to a future release pending upstream Anthropic stabilisation.
+
+## Claude session looks alive 30+ min after the final message
+
+**Symptoms:** Claude has clearly finished the turn (you can see the final answer in Telegram), but the session metadata indicates it's still running. The bidirectional Claude CLI is sitting idle holding stdin open.
+
+The post-result idle watchdog ([#333](https://github.com/littlebearapps/untether/issues/333)) closes the gap: every successful `result` event arms `[watchdog] post_result_idle_timeout` (default 600s / 10 min, range 30s–1h). Once the deadline passes the runner closes stdin and the CLI exits cleanly (rc=0). The footer also shows a `✓ turn complete` marker on every successful turn so you have an immediate visual confirmation that the turn has ended even if the process is still alive briefly.
+
+**To disable the timer entirely** (Claude CLI handles its own exit):
+
+```toml
+[watchdog]
+post_result_idle_enabled = false
+```
+
+**To shorten the timeout** for impatient deployments:
+
+```toml
+[watchdog]
+post_result_idle_timeout = 60   # 1 minute
+```
+
+If a button-click `control_response` is mid-flight when the deadline arrives, the timer re-arms instead of closing — preventing orphaned approvals. Look for `claude.post_result_idle.deferred` and `claude.post_result_idle.closing_stdin` in the logs to confirm the watchdog's behaviour.
+
+When the watchdog actually closes stdin, Untether also sends one (and only one) Telegram closing message: `✓ turn complete · session closed after Nm idle`. While the watchdog is running, stall warnings are suppressed (`progress_edits.stall_post_result_suppressed`) so you don't get noise during the legitimate idle window — genuinely-frozen post-result sessions still warn via the frozen-ring escalation.
 
 ## Messages too long or truncated
 
@@ -321,9 +384,9 @@ This is not a security concern — `UNTETHER_SESSION` is a simple signal variabl
 
 **Symptoms:** Bot works in private chat but ignores messages in a group.
 
-1. Check **trigger mode**: groups default to `mentions` in many setups. Send `/trigger` to check, or `/trigger all` to respond to everything.
+1. Check **listen mode**: groups default to `mentions` in many setups. Send `/listen` to check, or `/listen all` to respond to everything. (`/trigger` still works as a deprecated alias from v0.35.3 onward.)
 2. Check **bot privacy mode** in BotFather: send `/setprivacy` to @BotFather and select your bot. Set to "Disable" so the bot can see all messages (not just commands and @mentions).
-3. Check `allowed_user_ids` — if set, group members not in the list are ignored.
+3. Check `allowed_user_ids` — group members not in the list are ignored. (As of v0.35.3 the list is required at startup unless `allow_any_user = true` is set — see [security.md](security.md#restrict-access).)
 4. If using topics, make sure the bot has "Manage Topics" permission.
 
 ## macOS and Linux credential differences
@@ -450,6 +513,19 @@ Untether recognises **67 error patterns** across 14 categories:
 | Account & proxy | Account suspended, proxy auth, request timeout | All |
 
 For the full list of patterns and hints, see the [Error Reference](../reference/errors.md).
+
+## Loop didn't fire / loop fired too many times
+
+Loop mode (`/config → 🔁 Loop mode`) gates Untether's observation of Claude Code's `/loop` and `ScheduleWakeup` tools. ([#289](https://github.com/littlebearapps/untether/issues/289))
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `/loop` registered during the turn but no fires happened afterwards | Loop mode toggle is OFF (the default) | `/config → 🔁 Loop mode → 🔁 On` |
+| Loop stopped after N iterations | Hit `[loop] max_iterations` cap | Raise `max_iterations` in `untether.toml`, or restart the loop with a fresh `/loop` |
+| Loop ended with `daily_budget_exceeded` | Hit `[cost_budget] max_cost_per_day` | Raise the cap in `/config → 💰 Cost & usage`, or wait for the daily reset |
+| Loop fires happened but each was a "fresh user turn" rather than autonomous | This is by design — Untether re-issues the original prompt at each fire (see [Schedule tasks → Loop mode](schedule-tasks.md#loop-mode)) | N/A — expected behaviour |
+| Loop kept firing after `/cancel` | Stale `active_loops.json` | Restart `untether` (or the dev/staging unit) — the do-not-resume sentinel is loaded at startup and blocks future fires for cancelled sessions |
+| Loop didn't survive a restart | `active_loops.json` is missing or corrupt | Check `journalctl --user -u untether-dev -f` for `loop.restore.read_failed` warnings; the file lives next to your `untether.toml` |
 
 ## Related
 

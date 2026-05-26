@@ -18,7 +18,7 @@ from .markdown import format_meta_line, render_event_cli
 from .model import ActionEvent, CompletedEvent, ResumeToken, StartedEvent, UntetherEvent
 from .presenter import Presenter
 from .progress import ProgressTracker
-from .runner import Runner
+from .runner import _APPROVAL_PENDING_REFIRE_S, Runner
 from .transport import (
     ChannelId,
     MessageId,
@@ -203,6 +203,28 @@ def _load_watchdog_settings():
         return None
 
 
+def _load_progress_settings():
+    """Load progress settings from config, returning defaults if unavailable.
+
+    Read fresh per-run by ``handle_message`` so edits to ``[progress]`` in
+    ``untether.toml`` apply on the next run without restarting the bot
+    (#269). Sibling of ``_load_footer_settings`` / ``_load_watchdog_settings``.
+    """
+    from .settings import ProgressSettings
+
+    try:
+        from .settings import load_settings_if_exists
+
+        result = load_settings_if_exists()
+        if result is None:
+            return ProgressSettings()
+        settings, _ = result
+        return settings.progress
+    except Exception:  # noqa: BLE001
+        logger.warning("progress_settings.load_failed", exc_info=True)
+        return ProgressSettings()
+
+
 def _load_auto_continue_settings():
     """Load auto-continue settings from config, returning defaults if unavailable."""
     try:
@@ -266,6 +288,76 @@ def _should_auto_continue(
     return auto_continued_count < max_retries
 
 
+def _format_outbox_skipped_notice(skipped: list[tuple[str, str]]) -> str:
+    """#524: human-readable notice for outbox entries that were dropped
+    rather than delivered. Headline framing matches the agent's intent:
+    the user (and the agent reading in next-turn context) should see what
+    the agent meant to send and why it didn't ship.
+
+    Sorted by name, capped at 10 entries (rest collapsed to "...").
+    """
+    lines = ["\U0001f4ce Outbox skipped (unsupported / blocked):"]
+    items = sorted(skipped, key=lambda kv: kv[0])
+    cap = 10
+    for name, reason in items[:cap]:
+        suffix = "/" if reason == "directory" else ""
+        lines.append(f"- {name}{suffix} — {reason}")
+    if len(items) > cap:
+        lines.append(f"- … and {len(items) - cap} more")
+    return "\n".join(lines)
+
+
+async def _surface_outbox_skipped(
+    cfg: ExecBridgeConfig,
+    incoming: IncomingMessage,
+    user_ref: MessageRef,
+    skipped: list[tuple[str, str]],
+    outbox_config: Any,
+) -> None:
+    """#524 rc20 follow-up: send the 📎 Outbox skipped notice as a follow-up
+    Telegram message. Extracted so the same surface fires from both the
+    normal-completion and pre-auto-continue paths in handle_message, and
+    from the run_ok=False branch where outbox delivery itself is skipped
+    but the user still needs to know what the agent intended to send.
+
+    The "..." pseudo-entry is the max-files-exceeded notice which we keep
+    in logs but skip from the user-facing block (the per-file reason there
+    isn't actionable).
+    """
+    if not skipped:
+        return
+    if not getattr(outbox_config, "outbox_notify_skipped", True):
+        return
+    notable = [(name, reason) for (name, reason) in skipped if name != "..."]
+    if not notable:
+        return
+    text = _format_outbox_skipped_notice(notable)
+    try:
+        await cfg.transport.send(
+            channel_id=incoming.channel_id,
+            message=RenderedMessage(text=text, extra={}),
+            options=SendOptions(
+                reply_to=user_ref,
+                notify=False,
+                thread_id=incoming.thread_id,
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("outbox.skipped_notice_failed", exc_info=True)
+
+
+def _format_auto_continue_notice(auto_continued_count: int) -> str:
+    """#551 Tier 1: build the Telegram notice text shown when auto-continue
+    fires. The 🔁 prefix distinguishes auto-resume from a fresh start so
+    users don't ``/cancel`` the salvage. Appends an attempt suffix once we
+    are past the first retry.
+    """
+    notice = "\U0001f501 Auto-resuming session after upstream Claude Code event"
+    if auto_continued_count > 0:
+        notice += f" (attempt {auto_continued_count + 1})"
+    return notice
+
+
 _DEFAULT_PREAMBLE = (
     "[Untether] You are running via Untether, a Telegram bridge for coding agents. "
     "The user is interacting through Telegram on a mobile device.\n\n"
@@ -276,14 +368,39 @@ _DEFAULT_PREAMBLE = (
     "- If hooks fire at session end, your final response MUST still contain the "
     "user's requested content. Hook concerns are secondary — briefly note them "
     "AFTER the main content, never instead of it.\n\n"
-    "Every response that completes work MUST end with a structured summary:\n"
+    "Configuration changes (`untether.toml`):\n"
+    "- Untether hot-reloads `~/.untether/untether.toml` automatically — "
+    "edits take effect within ~1 second of saving.\n"
+    "- Do NOT run `systemctl --user restart untether` after editing config. "
+    "The restart is unnecessary, and because it shuts down the very session "
+    "issuing the command, the graceful drain will time out (120s) and your "
+    "final answer to the user will be silently dropped.\n"
+    "- Restart-only keys (`bot_token`, `chat_id`, `session_mode`, `topics`, "
+    "`message_overflow`) are flagged at reload time — if you didn't see "
+    "such a warning, no restart is needed.\n\n"
+    "Plan-mode requirements (when you call `ExitPlanMode`):\n"
+    "- Your `plan` parameter MUST be a concise 3–5 bullet summary of your "
+    "findings, decisions, or proposed changes — never just a file path. "
+    "Keep it short: the plan is shown to the user for approval, not as the "
+    "final deliverable.\n"
+    "- After `ExitPlanMode` is approved, your next assistant message — "
+    "which becomes the user's final Telegram message — should be a brief "
+    "CLI-style summary: 3–7 bullets or 1–2 short paragraphs covering key "
+    "findings, recommendations, decisions made, and next steps. Aim for "
+    "~500–1500 characters total. Do NOT re-paste the full plan content — "
+    "the user has already seen it during approval. Brevity is the goal; "
+    'do not just write "Plan approved" either.\n\n'
+    "Every response that completes work MUST end with a structured summary "
+    "(keep each section brief — headline bullets, not full content; aim "
+    "for ~500–1500 characters total across the whole summary):\n"
     "  ## Summary\n"
     "  ### Completed\n"
-    "  - [What was done, with specific file paths and line numbers where relevant]\n"
-    "  - [Key decisions made and why]\n"
+    "  - [What was done — short bullets with file paths/line numbers]\n"
+    "  - [Key decisions made and why — one line each]\n"
     "  ### Plan/Document Created (if applicable)\n"
-    "  - [Path and concise summary of any plan, design doc, or document created — "
-    "the user cannot easily open files from Telegram]\n"
+    "  - [Path AND a 3–5 bullet headline summary — the user has already "
+    "seen the plan during approval, so this is a pointer + headline, not "
+    "a re-paste of the full content]\n"
     "  ### Files for Review (if applicable)\n"
     "  - To send files to the user, write them to `.untether-outbox/`\n"
     "  - Example: `mkdir -p .untether-outbox && cp docs/plan.md .untether-outbox/`\n"
@@ -388,18 +505,40 @@ def _resolve_presenter(
     return default_presenter
 
 
+# #410: schema-mismatch surfacing — promoted from one-shot per-process to
+# per-call counter so the issue-watcher actually creates an issue when API-
+# shape drift starts happening (one-shot logs only fire once per restart, so
+# operators were missing ongoing drift between restarts). Counter is exposed
+# for the /usage debug section.
+_USAGE_SCHEMA_MISMATCH_COUNT = 0
+# #410: legacy boolean kept temporarily for any external code that imported
+# `_USAGE_SCHEMA_WARNED`. It now mirrors "count > 0" rather than gating
+# subsequent warnings — the new counter logs every call.
 _USAGE_SCHEMA_WARNED = False
 _USAGE_EXPECTED_WINDOW_FIELDS = frozenset({"utilization", "resets_at"})
 
 
+def get_usage_schema_mismatch_count() -> int:
+    """Return the running count of subscription-usage schema mismatches (#410).
+
+    Used by the ``/usage`` debug section. Tests reset by setting
+    ``_USAGE_SCHEMA_MISMATCH_COUNT = 0`` directly on the module.
+    """
+    return _USAGE_SCHEMA_MISMATCH_COUNT
+
+
 def _validate_usage_schema(data: dict[str, Any]) -> None:
-    """Log a one-shot warning if the subscription-usage payload is missing
+    """Log a warning every time the subscription-usage payload is missing
     expected fields. Does not mutate `data` — downstream code already handles
     missing sections defensively; this is purely an observability signal so
-    API-shape drift is noticed instead of silently ignored."""
-    global _USAGE_SCHEMA_WARNED
-    if _USAGE_SCHEMA_WARNED:
-        return
+    API-shape drift is noticed instead of silently ignored.
+
+    #410: changed from one-shot-per-process to per-call so the
+    issue-watcher fires for ongoing drift. The structlog event includes a
+    cumulative ``count`` field so callers can rate-limit on their side if
+    they want.
+    """
+    global _USAGE_SCHEMA_MISMATCH_COUNT, _USAGE_SCHEMA_WARNED
     missing: list[str] = []
     for window in ("five_hour", "seven_day"):
         section = data.get(window)
@@ -414,8 +553,13 @@ def _validate_usage_schema(data: dict[str, Any]) -> None:
             if field_name not in section
         )
     if missing:
+        _USAGE_SCHEMA_MISMATCH_COUNT += 1
         _USAGE_SCHEMA_WARNED = True
-        logger.warning("claude_usage.schema_mismatch", missing=missing)
+        logger.warning(
+            "claude_usage.schema_mismatch",
+            missing=missing,
+            count=_USAGE_SCHEMA_MISMATCH_COUNT,
+        )
 
 
 async def _maybe_append_usage_footer(
@@ -835,6 +979,14 @@ class ProgressEdits:
         self._stall_repeat_seconds: float = 180.0
         self._prev_recent_events: list[tuple[float, str]] | None = None
         self._frozen_ring_count: int = 0
+        # #481: heartbeat tick cadence. The stall monitor loop sleeps
+        # ``min(_heartbeat_interval, _stall_check_interval)`` per tick, so
+        # in production ticks fire every 30 s instead of 60 s; the stall
+        # threshold + ``_stall_repeat_seconds`` wall-clock gates still
+        # control warning frequency unchanged.
+        self._heartbeat_interval: float = 30.0
+        # #481: bash grace window for the stall_bash_grace_suppressed branch.
+        self._bash_grace_seconds: float = 60.0
         # Stuck-after-tool_result detector (#322). Instance overrides of the
         # class-level defaults, populated from WatchdogSettings in
         # handle_message.
@@ -843,6 +995,14 @@ class ProgressEdits:
         self._stuck_after_tool_result_recovery_enabled: bool = True
         self._stuck_after_tool_result_recovery_delay: float = 60.0
         self._stuck_state: _StuckAfterToolResultState | None = None
+        # #333 Tier 2: one-shot guard so we only log the limbo detection
+        # once per session, not on every 60 s stall tick.
+        self._post_result_limbo_logged: bool = False
+        # #526: pacing for the ``subprocess.approval_pending`` INFO event so
+        # an approval-waiting session emits at most every 30 min — gives
+        # operators a heartbeat without padding warn-filters with WARNs
+        # that would otherwise fire identically to genuine stalls.
+        self._last_approval_pending_emit_at: float = 0.0
         self.pid: int | None = None
         self.stream: Any = None  # JsonlStreamState, set from run_runner_with_cancel
         self.cancel_event: anyio.Event | None = None  # threaded from RunningTask
@@ -867,16 +1027,148 @@ class ProgressEdits:
             await self._run_loop(bg_tg)
             stall_scope.cancel()
 
+    def _heartbeat_tick(self) -> None:
+        """#481: per-tick visibility refresh.
+
+        Runs on EVERY monitor loop tick (both heartbeat-only and stall-check
+        ticks). Three responsibilities, none of which touch stall counters:
+
+        1. Mutate ``action.detail['countdown_s']`` for any open
+           ScheduleWakeup/Monitor action whose deadline lives in
+           ``engine_state.live_wakeups`` / ``live_monitors``. The verbose
+           detail formatter reads this on the next render.
+        2. Fire the post-result closing message exactly once when the
+           Claude watchdog has stamped ``post_result_closed_at`` (#470).
+        3. Bump ``event_seq`` to wake the render loop when any open action
+           is older than 60 s — this keeps the elapsed-time tail current
+           in the chat (otherwise the message looks frozen during long
+           BashOutput polling cycles).
+        """
+        stream = self.stream
+        engine_state = getattr(stream, "engine_state", None) if stream else None
+        live_wakeups = (
+            getattr(engine_state, "live_wakeups", None) if engine_state else None
+        )
+        live_monitors = (
+            getattr(engine_state, "live_monitors", None) if engine_state else None
+        )
+        now = self.clock()
+        # 1) Countdown mutation — ScheduleWakeup + Monitor.
+        if live_wakeups or live_monitors:
+            for action_state in self.tracker._actions.values():
+                if action_state.completed:
+                    continue
+                aid = str(action_state.action.id or "")
+                if not aid:
+                    continue
+                deadline: float | None = None
+                if live_wakeups and aid in live_wakeups:
+                    deadline = live_wakeups[aid]
+                elif live_monitors and aid in live_monitors:
+                    deadline = live_monitors[aid]
+                if deadline is None:
+                    continue
+                # Deadline 0.0 = unknown → leave countdown_s unset so the
+                # formatter falls back to delaySeconds-from-input rendering.
+                if deadline > 0:
+                    action_state.action.detail["countdown_s"] = max(0.0, deadline - now)
+
+        # 2) Post-result closing message — one-shot.
+        if (
+            engine_state is not None
+            and getattr(engine_state, "post_result_closed_at", None) is not None
+            and not getattr(engine_state, "post_result_closing_sent", False)
+        ):
+            mins = int(getattr(engine_state, "post_result_idle_minutes", 0.0))
+            text = f"✓ turn complete · session closed after {mins}m idle"
+            with contextlib.suppress(
+                anyio.WouldBlock,
+                anyio.BrokenResourceError,
+                anyio.ClosedResourceError,
+            ):
+                self.signal_send.send_nowait(None)
+            # Schedule the actual transport.send via the run loop's task
+            # group — the heartbeat tick is sync inside _stall_monitor's
+            # async loop, so we just stash a flag and let the caller fire
+            # the actual send (next tick reads post_result_closing_sent).
+            engine_state.post_result_closing_sent = True
+            # Hand the message off to the bridge's async send via a
+            # one-element queue field.
+            self._pending_closing_message = text
+
+        # 3) Long-running tail refresh — bump event_seq so the renderer
+        #    redraws with the fresh elapsed-time tail.
+        for action_state in self.tracker._actions.values():
+            if action_state.completed:
+                continue
+            if action_state.started_at == 0.0:
+                continue
+            if (now - action_state.started_at) > 60.0:
+                self._bump_heartbeat()
+                break
+
+    async def _flush_pending_closing_message(self) -> None:
+        """#470: send the one-shot post-result closing Telegram message.
+
+        Called from _stall_monitor after _heartbeat_tick. Idempotent — the
+        ``_pending_closing_message`` field is None except for the single
+        tick after the watchdog stamps post_result_closed_at.
+        """
+        text = getattr(self, "_pending_closing_message", None)
+        if not text:
+            return
+        self._pending_closing_message = None
+        try:
+            await self.transport.send(
+                channel_id=self.channel_id,
+                message=RenderedMessage(text=text),
+                options=SendOptions(thread_id=self.thread_id),
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "progress_edits.post_result_closing_send_failed", exc_info=True
+            )
+
     async def _stall_monitor(self) -> None:
-        """Periodically check for event stalls, log diagnostics, and notify."""
+        """Periodically check for event stalls, log diagnostics, and notify.
+
+        Two cadences (#481):
+        - **Heartbeat tick** every ``_heartbeat_interval`` (default 30 s):
+          updates countdowns, fires closing message, refreshes elapsed
+          tail. No stall counters touched.
+        - **Stall check** every ``_stall_check_interval`` (default 60 s):
+          full diagnostics, threshold selection, suppression matrix,
+          notification or auto-cancel.
+
+        The loop sleeps ``min(heartbeat_interval, stall_check_interval)``
+        per tick. The stall path runs only when enough wall-clock has
+        elapsed since the last stall check, preserving the existing
+        ``stall_repeat_seconds`` ≈ 3-tick math the test suite relies on.
+        """
         from .utils.proc_diag import (
             collect_proc_diag,
             is_cpu_active,
             is_tree_cpu_active,
         )
 
+        # Initialise pending closing-message slot used by _heartbeat_tick.
+        self._pending_closing_message: str | None = None
+
         while True:
-            await anyio.sleep(self._stall_check_interval)
+            # #481: tick at the FASTER of the two cadences — heartbeat
+            # (30 s default) drives the long-running tail and closing
+            # message; stall warnings still gate themselves at wall-clock
+            # ``_stall_repeat_seconds`` (180 s default) so faster ticks
+            # don't cause warning spam (the gate at line 992-993 below
+            # bails out when too soon to repeat). Tests that override
+            # ``_stall_check_interval`` to 0.01 s still get fast ticks.
+            tick_interval = min(self._heartbeat_interval, self._stall_check_interval)
+            await anyio.sleep(tick_interval)
+
+            # Heartbeat tick — cheap (no proc_diag, just dict scans).
+            self._heartbeat_tick()
+            await self._flush_pending_closing_message()
+
             # #203: piggy-back a TTL sweep of module-level registries on this
             # periodic tick.  Cheap when idle (empty dicts → early return).
             sweep_stale_registries()
@@ -904,7 +1196,14 @@ class ProgressEdits:
             # tool, or when child processes are active (Agent subagents).
             mcp_server = self._has_running_mcp_tool()
             if self._has_pending_approval():
-                threshold = self._STALL_THRESHOLD_APPROVAL
+                # #526 rc20 follow-up: first reminder at 600 s (so users
+                # get a visible "no action needed" message in the same
+                # window as a normal stall), subsequent reminders gated
+                # by the 1800 s refire threshold.
+                if self._last_approval_pending_emit_at == 0.0:
+                    threshold = self._STALL_THRESHOLD_APPROVAL_FIRST
+                else:
+                    threshold = self._STALL_THRESHOLD_APPROVAL
                 threshold_reason = "pending_approval"
             elif mcp_server is not None:
                 threshold = self._STALL_THRESHOLD_MCP_TOOL
@@ -939,6 +1238,60 @@ class ProgressEdits:
             self._total_stall_warn_count += 1
             self._last_stall_warn_at = now
 
+            # #470/#481: compute the 5 expected-wait booleans once. Used to
+            # gate BOTH the auto-cancel arm (below) and the notification
+            # branches (further down — those add a ``not frozen_escalate``
+            # master gate so genuinely-frozen sessions still warn). Auto-
+            # cancel is gated unconditionally — a session that's about to
+            # gracefully close (#470 watchdog) or legitimately waiting on
+            # a pending timer (#481) must not be killed.
+            _post_result_idle = self._is_post_result_idle()
+            _wakeup_state = self._has_pending_wakeup()
+            _monitor_state = self._has_active_monitor()
+            _bash_grace = self._has_recent_bash_action(self._bash_grace_seconds)
+            _bash_fresh = self._has_fresh_bash_output(threshold / 2.0)
+            # #333 Tier 2 (defense-in-depth): post-result idle alone is no
+            # longer enough to suppress auto-cancel indefinitely. The
+            # claude.py watchdog (Tier 1) should close the subprocess
+            # within ``post_result_idle_timeout + grace`` (≈ 660 s). If
+            # we're still in post-result idle past the limbo threshold
+            # AND no other expected-wait flag is set, treat as limbo and
+            # let auto-cancel fire. Older expected-wait suppression is
+            # preserved for the legitimate case (e.g. ScheduleWakeup, an
+            # active Monitor, or a long bash polling loop).
+            _post_result_age = self._post_result_idle_age_seconds()
+            _post_result_limbo = (
+                _post_result_idle
+                and _post_result_age is not None
+                and _post_result_age > self._POST_RESULT_LIMBO_THRESHOLD_S
+            )
+            _real_pending = (
+                _wakeup_state is not None
+                or _monitor_state is not None
+                or _bash_grace
+                or _bash_fresh
+            )
+            _expected_wait = (
+                _post_result_idle and not _post_result_limbo
+            ) or _real_pending
+
+            # #333 Tier 2: one-shot warning when limbo is detected. This
+            # complements the claude.py watchdog's ``runner.limbo_detected``
+            # event from the runner side — both signals get picked up by
+            # ``untether-issue-watcher`` and indicate Tier 1 missed an
+            # edge case (subprocess wouldn't die to SIGTERM/SIGKILL, or
+            # the watchdog itself never ran).
+            if _post_result_limbo and not self._post_result_limbo_logged:
+                self._post_result_limbo_logged = True
+                logger.warning(
+                    "progress_edits.post_result_limbo_detected",
+                    channel_id=self.channel_id,
+                    pid=self.pid,
+                    post_result_age_s=round(_post_result_age or 0.0, 1),
+                    limbo_threshold_s=self._POST_RESULT_LIMBO_THRESHOLD_S,
+                    stall_warn_count=self._stall_warn_count,
+                )
+
             last_action = self._last_action_summary()
 
             recent = list(self.stream.recent_events) if self.stream else []
@@ -948,28 +1301,68 @@ class ProgressEdits:
                 else None
             )
 
-            logger.warning(
-                "progress_edits.stall_detected",
-                channel_id=self.channel_id,
-                seconds_since_last_event=round(elapsed, 1),
-                last_event_seq=self.event_seq,
-                stall_warn_count=self._stall_warn_count,
-                pid=self.pid,
-                last_action=last_action,
-                last_event_type=(self.stream.last_event_type if self.stream else None),
-                process_alive=diag.alive if diag else None,
-                process_state=diag.state if diag else None,
-                tcp_established=diag.tcp_established if diag else None,
-                tcp_total=diag.tcp_total if diag else None,
-                rss_kb=diag.rss_kb if diag else None,
-                fd_count=diag.fd_count if diag else None,
-                cpu_active=cpu_active,
-                tree_active=tree_active,
-                recent_events=[(round(t, 1), lbl) for t, lbl in recent[-5:]],
-                stderr_hint=stderr_hint,
-            )
+            # #526: when the stall is the user reading the plan /
+            # deliberating on an approval, demote the WARN to a different
+            # structured INFO (``subprocess.approval_pending``) and pace it
+            # to once per 30 minutes. The chat-side rendering below still
+            # emits the friendly "⏳ Awaiting your approval (N min)" copy
+            # (#494-C) — operators just stop getting warn-filter spam for
+            # what is by definition not a hang. The daemon
+            # (``untether-issue-watcher``) and ``/monitor`` are configured
+            # to treat WARNs as auto-fileable, so this also stops
+            # spurious GitHub issue creation (closes #533).
+            if threshold_reason == "pending_approval":
+                if (
+                    self._last_approval_pending_emit_at == 0.0
+                    or now - self._last_approval_pending_emit_at
+                    >= _APPROVAL_PENDING_REFIRE_S
+                ):
+                    self._last_approval_pending_emit_at = now
+                    logger.info(
+                        "subprocess.approval_pending",
+                        channel_id=self.channel_id,
+                        engine=getattr(self.tracker, "engine", None),
+                        pid=self.pid,
+                        seconds_since_last_event=round(elapsed, 1),
+                        last_action=last_action,
+                        recent_events=[(round(t, 1), lbl) for t, lbl in recent[-3:]],
+                        approval_pending=True,
+                        source="bridge",
+                    )
+            else:
+                logger.warning(
+                    "progress_edits.stall_detected",
+                    channel_id=self.channel_id,
+                    seconds_since_last_event=round(elapsed, 1),
+                    last_event_seq=self.event_seq,
+                    stall_warn_count=self._stall_warn_count,
+                    pid=self.pid,
+                    last_action=last_action,
+                    last_event_type=(
+                        self.stream.last_event_type if self.stream else None
+                    ),
+                    process_alive=diag.alive if diag else None,
+                    process_state=diag.state if diag else None,
+                    tcp_established=diag.tcp_established if diag else None,
+                    tcp_total=diag.tcp_total if diag else None,
+                    rss_kb=diag.rss_kb if diag else None,
+                    fd_count=diag.fd_count if diag else None,
+                    cpu_active=cpu_active,
+                    tree_active=tree_active,
+                    recent_events=[(round(t, 1), lbl) for t, lbl in recent[-5:]],
+                    stderr_hint=stderr_hint,
+                    approval_pending=False,
+                )
 
-            # Auto-cancel: dead process, no-PID zombie, or absolute cap
+            # Auto-cancel: dead process, no-PID zombie, or absolute cap.
+            # #470/#481: when an expected-wait state is active, skip the
+            # ``max_warnings`` arm — auto-cancel was designed for "the
+            # subprocess is stuck", not for "the watchdog is doing its job"
+            # (post-result idle) or "we're waiting on a legitimate timer"
+            # (ScheduleWakeup/Monitor/Bash polling). The ``process_dead``
+            # and ``no_pid_no_events`` arms still fire — those mean the
+            # subprocess actually crashed/never started, which is fatal
+            # regardless of the wait state.
             auto_cancel_reason: str | None = None
             if diag and diag.alive is False:
                 auto_cancel_reason = "process_dead"
@@ -979,6 +1372,24 @@ class ProgressEdits:
                 and self._stall_warn_count >= self._STALL_MAX_WARNINGS_NO_PID
             ):
                 auto_cancel_reason = "no_pid_no_events"
+            elif _expected_wait:
+                # Don't auto-cancel during expected waits even if
+                # warn_count has accumulated. Each new tick will re-check
+                # whether the wait state still holds; once Claude resumes
+                # emitting events, _stall_warned resets via _last_event_at
+                # and the warn_count effectively rolls back.
+                self._bump_stall_suppression("expected_wait")
+                logger.info(
+                    "progress_edits.stall_auto_cancel_suppressed_expected_wait",
+                    channel_id=self.channel_id,
+                    stall_warn_count=self._stall_warn_count,
+                    pid=self.pid,
+                    post_result=_post_result_idle,
+                    pending_wakeup=_wakeup_state is not None,
+                    active_monitor=_monitor_state is not None,
+                    bash_grace=_bash_grace,
+                    bash_fresh=_bash_fresh,
+                )
             elif self._stall_warn_count >= self._STALL_MAX_WARNINGS:
                 # Suppress auto-cancel when process is actively working
                 # (CPU ticks incrementing between diagnostic snapshots).
@@ -1087,7 +1498,69 @@ class ProgressEdits:
                     self.signal_send.send_nowait(None)
                 continue
 
-            if cpu_active is True and not frozen_escalate and not main_sleeping:
+            # #470/#481: expected-wait suppression matrix. Gated by
+            # ``not frozen_escalate`` — a genuinely-frozen session
+            # (no JSONL events for 3+ stall ticks AND CPU still active)
+            # falls through to the existing notification path so the
+            # user gets a real warning. Each branch logs its own info
+            # event so journalctl can audit which rule fired. The
+            # heartbeat bump keeps the elapsed-time tail current
+            # without resetting stall counters.
+            if not frozen_escalate and _post_result_idle:
+                self._bump_stall_suppression("post_result")
+                logger.info(
+                    "progress_edits.stall_post_result_suppressed",
+                    channel_id=self.channel_id,
+                    seconds_since_last_event=round(elapsed, 1),
+                    stall_warn_count=self._stall_warn_count,
+                    pid=self.pid,
+                )
+                self._bump_heartbeat()
+            elif not frozen_escalate and _wakeup_state is not None:
+                soonest, count = _wakeup_state
+                logger.info(
+                    "progress_edits.stall_schedule_wakeup_suppressed",
+                    channel_id=self.channel_id,
+                    seconds_since_last_event=round(elapsed, 1),
+                    stall_warn_count=self._stall_warn_count,
+                    pid=self.pid,
+                    soonest_remaining_s=round(soonest, 1),
+                    wakeup_count=count,
+                )
+                self._bump_heartbeat()
+            elif not frozen_escalate and _monitor_state is not None:
+                soonest, count = _monitor_state
+                logger.info(
+                    "progress_edits.stall_monitor_active_suppressed",
+                    channel_id=self.channel_id,
+                    seconds_since_last_event=round(elapsed, 1),
+                    stall_warn_count=self._stall_warn_count,
+                    pid=self.pid,
+                    soonest_remaining_s=round(soonest, 1),
+                    monitor_count=count,
+                )
+                self._bump_heartbeat()
+            elif not frozen_escalate and _bash_grace:
+                logger.info(
+                    "progress_edits.stall_bash_grace_suppressed",
+                    channel_id=self.channel_id,
+                    seconds_since_last_event=round(elapsed, 1),
+                    stall_warn_count=self._stall_warn_count,
+                    pid=self.pid,
+                    bash_grace_seconds=self._bash_grace_seconds,
+                )
+                self._bump_heartbeat()
+            elif not frozen_escalate and _bash_fresh:
+                logger.info(
+                    "progress_edits.stall_long_bash_suppressed",
+                    channel_id=self.channel_id,
+                    seconds_since_last_event=round(elapsed, 1),
+                    stall_warn_count=self._stall_warn_count,
+                    pid=self.pid,
+                    freshness_threshold_s=round(threshold / 2.0, 1),
+                )
+                self._bump_heartbeat()
+            elif cpu_active is True and not frozen_escalate and not main_sleeping:
                 logger.info(
                     "progress_edits.stall_suppressed_notification",
                     channel_id=self.channel_id,
@@ -1144,6 +1617,7 @@ class ProgressEdits:
                 # already sent, suppress repeats.  Similar to tool-active
                 # suppression but triggered by tree CPU (child processes)
                 # instead of tracked tool state.
+                self._bump_stall_suppression("children_active")
                 logger.info(
                     "progress_edits.stall_children_active_suppressed",
                     channel_id=self.channel_id,
@@ -1165,6 +1639,10 @@ class ProgressEdits:
                 # ring buffer escalation despite CPU activity)
                 mins = int(elapsed // 60)
                 mcp_hung = mcp_server is not None and frozen_escalate
+                # Initialised here (not inside the final else) so the
+                # _genuinely_stuck predicate below can reference it safely
+                # from every branch.
+                _tool_name: str | None = None
                 if mcp_hung:
                     logger.warning(
                         "progress_edits.mcp_tool_hung",
@@ -1207,6 +1685,19 @@ class ProgressEdits:
                         parts = [
                             f"⏳ No progress for {mins} min (CPU active, no new events)"
                         ]
+                elif threshold_reason == "pending_approval":
+                    # #494-C: user is waiting on an approval button; the stall
+                    # warning is expected, not a sign the agent has frozen.
+                    # Distinguish from genuine "no progress" copy so the user
+                    # realises the buttons above are theirs to action.
+                    # #526 rc20 follow-up: nsd evidence (2026-05-18) showed
+                    # users cancelling at ~13 min because the original copy
+                    # didn't make the "tap a button" affordance explicit
+                    # enough — they assumed the session had hung.
+                    parts = [
+                        f"⏳ Awaiting your approval ({mins} min) — tap a "
+                        "button above to proceed (no action needed otherwise)"
+                    ]
                 elif mcp_server is not None:
                     parts = [f"⏳ MCP tool running: {mcp_server} ({mins} min)"]
                 elif threshold_reason == "active_children":
@@ -1223,7 +1714,6 @@ class ProgressEdits:
                     # Extract tool name from last running action for
                     # actionable stall messages ("Bash command still running"
                     # instead of generic "session may be stuck").
-                    _tool_name = None
                     if last_action:
                         for _prefix in ("tool:", "note:", "command:"):
                             if last_action.startswith(_prefix):
@@ -1248,12 +1738,14 @@ class ProgressEdits:
                 if self._stall_warn_count > 1:
                     parts[0] += f" (warned {self._stall_warn_count}x)"
                 # "session may be stuck" — only when genuinely stuck
-                # (no tool identified, cpu not active, not MCP/frozen)
+                # (no tool identified, cpu not active, not MCP/frozen,
+                # not waiting on a user approval button — #494-C)
                 _genuinely_stuck = (
                     not mcp_hung
                     and not frozen_escalate
                     and mcp_server is None
                     and threshold_reason != "active_children"
+                    and threshold_reason != "pending_approval"
                     and not (_tool_name and main_sleeping)
                     and cpu_active is not True
                 )
@@ -1281,6 +1773,214 @@ class ProgressEdits:
                         "progress_edits.stall_notify_failed",
                         exc_info=True,
                     )
+
+    def _bump_heartbeat(self) -> None:
+        """Wake the render loop without changing stall counters or last_event_at.
+
+        Used by both existing CPU-active suppression branches (lines 1148-,
+        1179-, 1205-) and the new #481 suppression matrix. Idempotent —
+        the signal channel is buffer=1; subsequent send_nowait calls hit
+        WouldBlock harmlessly because the loop only re-renders if
+        rendered_seq != event_seq.
+        """
+        self.event_seq += 1
+        with contextlib.suppress(
+            anyio.WouldBlock,
+            anyio.BrokenResourceError,
+            anyio.ClosedResourceError,
+        ):
+            self.signal_send.send_nowait(None)
+
+    def _bump_stall_suppression(self, reason: str) -> None:
+        """#333 Task 4b: count a suppression event for ``session.summary``.
+
+        ``reason`` is a stable kebab-case label (e.g. ``"post_result"``,
+        ``"children_active"``, ``"expected_wait"``). Stored on the
+        stream's ``stall_suppression_counts`` dict so the summary line
+        in ``session.summary`` (emitted from ``run_runner_with_cancel``)
+        can render ``stall_suppressions=expected_wait:N,post_result:N``.
+        """
+        if self.stream is None:
+            return
+        counts = getattr(self.stream, "stall_suppression_counts", None)
+        if counts is None:
+            return
+        counts[reason] = counts.get(reason, 0) + 1
+
+    def _is_post_result_idle(self) -> bool:
+        """#470: suppression — Claude session is past its `result` event.
+
+        Returns True when ``stream.last_event_type == "result"`` AND
+        ``engine_state.result_received_at`` is armed (i.e. the post-result
+        idle watchdog is the legitimate owner of the silence). The
+        bidirectional CLI keeps stdin open between turns; the watchdog
+        will close it after ``post_result_idle_timeout``. Stall warnings
+        during that window are pure noise — and the auto-cancel arm would
+        otherwise wrongly kill a session that's about to gracefully close.
+
+        Stays engine-agnostic via getattr — engines without engine_state
+        no-op gracefully.
+        """
+        stream = self.stream
+        if stream is None:
+            return False
+        if getattr(stream, "last_event_type", None) != "result":
+            return False
+        engine_state = getattr(stream, "engine_state", None)
+        if engine_state is None:
+            return False
+        return getattr(engine_state, "result_received_at", None) is not None
+
+    def _post_result_idle_age_seconds(self) -> float | None:
+        """#333 Tier 2: seconds since ``result_received_at`` was armed.
+
+        Returns None if not in post-result idle state. Used by the stall
+        detector to detect limbo — when the watchdog's post-result
+        countdown should have closed the subprocess but didn't.
+
+        Uses ``self.clock()`` (matches the bridge's clock injection) — in
+        production this is ``time.monotonic`` which is what claude.py uses
+        to set ``result_received_at``; in tests it's the fake clock so
+        ages line up with whatever the test driver advances.
+        """
+        stream = self.stream
+        if stream is None:
+            return None
+        engine_state = getattr(stream, "engine_state", None)
+        if engine_state is None:
+            return None
+        armed_at = getattr(engine_state, "result_received_at", None)
+        if armed_at is None:
+            return None
+        return self.clock() - armed_at
+
+    def _has_pending_wakeup(self) -> tuple[float, int] | None:
+        """#481: suppression — ScheduleWakeup with future deadline.
+
+        Returns (soonest_remaining_seconds, count) when at least one entry
+        in ``engine_state.live_wakeups`` has a deadline still in the future
+        (or 0.0, which means the deadline is unknown but the wakeup is
+        armed — still a legitimate wait). Returns None otherwise.
+
+        ScheduleWakeup parks the Claude subprocess waiting for an upstream
+        timer fire (#289); during that wait Untether sees no JSONL events
+        but the silence is expected. This suppression only fires the
+        Telegram notification — the structlog WARN at line 1000 still
+        emits, so untether-issue-watcher and ops dashboards stay informed.
+        """
+        stream = self.stream
+        if stream is None:
+            return None
+        engine_state = getattr(stream, "engine_state", None)
+        if engine_state is None:
+            return None
+        live = getattr(engine_state, "live_wakeups", None)
+        if not live:
+            return None
+        now = self.clock()
+        soonest: float | None = None
+        for deadline in live.values():
+            # 0.0 = unknown deadline (legacy delay_ms fallback path or
+            # malformed input); treat as still-armed so we don't suppress
+            # the warning forever.
+            if deadline == 0.0:
+                soonest = 0.0
+                continue
+            remaining = deadline - now
+            if remaining <= 0:
+                continue
+            if soonest is None or remaining < soonest:
+                soonest = remaining
+        if soonest is None:
+            return None
+        return (soonest, len(live))
+
+    def _has_active_monitor(self) -> tuple[float, int] | None:
+        """#481: suppression — Monitor handle with future deadline.
+
+        Mirrors ``_has_pending_wakeup`` for ``engine_state.live_monitors``.
+        Monitor primitives park the subprocess on a child-process or
+        external-event watcher; legitimate silence until the deadline.
+        """
+        stream = self.stream
+        if stream is None:
+            return None
+        engine_state = getattr(stream, "engine_state", None)
+        if engine_state is None:
+            return None
+        live = getattr(engine_state, "live_monitors", None)
+        if not live:
+            return None
+        now = self.clock()
+        soonest: float | None = None
+        for deadline in live.values():
+            if deadline == 0.0:
+                soonest = 0.0
+                continue
+            remaining = deadline - now
+            if remaining <= 0:
+                continue
+            if soonest is None or remaining < soonest:
+                soonest = remaining
+        if soonest is None:
+            return None
+        return (soonest, len(live))
+
+    def _last_action_age(self) -> tuple[str | None, float | None]:
+        """Return (tool_name, age_seconds) for the most-recent open action.
+
+        Walks ``tracker._actions`` newest-first (insertion order in the
+        dict; the tracker doesn't reorder). Returns (None, None) when no
+        open action exists or when ``started_at`` is unset (legacy paths
+        without a clock).
+        """
+        for action_state in reversed(list(self.tracker._actions.values())):
+            if action_state.completed:
+                return (None, None)
+            name = action_state.action.detail.get("name") or action_state.action.title
+            tool_name = name if isinstance(name, str) else None
+            started_at = action_state.started_at
+            if started_at == 0.0:
+                return (tool_name, None)
+            return (tool_name, self.clock() - started_at)
+        return (None, None)
+
+    def _has_recent_bash_action(self, grace_s: float) -> bool:
+        """#481: suppression — Bash/BashOutput/KillShell within grace window.
+
+        Returns True when the most recent open action is a Bash-family
+        tool and its age is less than ``grace_s``. Covers the "command
+        is in its startup phase / first poll cycle" window where the
+        chat-side stall warning would be premature.
+        """
+        tool_name, age = self._last_action_age()
+        if tool_name is None or age is None:
+            return False
+        if tool_name not in ("Bash", "BashOutput", "KillShell"):
+            return False
+        return age < grace_s
+
+    def _has_fresh_bash_output(self, freshness_s: float) -> bool:
+        """#481: suppression — recent BashOutput tool_use within freshness_s.
+
+        BashOutput is Claude Code's mechanism for polling backgrounded
+        Bash shells; each call is a fresh tool_use+tool_result cycle. The
+        most-recent BashOutput's last_update_at signals "Claude got new
+        stdout from this bash recently", which IS the upstream proxy for
+        "the command isn't actually frozen". Returns True when any open
+        or recently-completed BashOutput action has last_update_at within
+        the freshness window.
+        """
+        now = self.clock()
+        for action_state in self.tracker._actions.values():
+            name = action_state.action.detail.get("name") or action_state.action.title
+            if name != "BashOutput":
+                continue
+            if action_state.last_update_at == 0.0:
+                continue
+            if (now - action_state.last_update_at) < freshness_s:
+                return True
+        return False
 
     def _has_pending_approval(self) -> bool:
         """Check if the most recent non-completed action is waiting for user approval."""
@@ -1554,7 +2254,10 @@ class ProgressEdits:
                 meta_formatter=format_meta_line,
             )
             rendered = self.presenter.render_progress(
-                state, elapsed_s=now - self.started_at, label=self.label
+                state,
+                elapsed_s=now - self.started_at,
+                label=self.label,
+                now=now,
             )
             # Detect approval button transitions for push notification
             new_kb = rendered.extra.get("reply_markup", {}).get("inline_keyboard", [])
@@ -1751,10 +2454,25 @@ class ProgressEdits:
     _STALL_THRESHOLD_TOOL: float = 600.0  # 10 minutes when a tool is actively running
     _STALL_THRESHOLD_MCP_TOOL: float = 900.0  # 15 min for MCP tools (network-bound)
     _STALL_THRESHOLD_SUBAGENT: float = 900.0  # 15 min for child process / subagent work
-    _STALL_THRESHOLD_APPROVAL: float = 1800.0  # 30 minutes when waiting for approval
+    # #526 rc20 follow-up: two-tier threshold for approval-pending stalls.
+    # First reminder fires at 600 s so users get a reassuring "tap a button
+    # above" message within the same window as a normal-tool stall (10 min)
+    # — without it, nsd evidence (2026-05-18) showed users ``/cancel``-ing
+    # productive sessions after ~13 min of silence. Subsequent reminders
+    # fall back to 1800 s (30 min) so the chat doesn't get noisy on long
+    # deliberations.
+    _STALL_THRESHOLD_APPROVAL_FIRST: float = 600.0
+    _STALL_THRESHOLD_APPROVAL: float = 1800.0  # refire threshold after first
     _STALL_MAX_WARNINGS: int = 10  # absolute cap
     _STALL_MAX_WARNINGS_NO_PID: int = 3  # aggressive cap when pid=None + no events
     _TCP_ACTIVE_THRESHOLD: int = 20  # TCP connections above this suggest active work
+    # #333 Tier 2: post-result idle limbo threshold. The Claude watchdog
+    # (claude.py:_post_result_idle_watchdog + _post_result_subcountdown)
+    # closes the subprocess within ``post_result_idle_timeout`` (600 s) +
+    # 5 s SIGTERM grace + observation slack. If we're still in post-
+    # result idle past this point with no other expected-wait signal,
+    # Tier 1 missed an edge case — stop suppressing auto-cancel.
+    _POST_RESULT_LIMBO_THRESHOLD_S: float = 660.0
 
     async def on_event(self, evt: UntetherEvent) -> None:
         if not self.tracker.note_event(evt):
@@ -2072,6 +2790,13 @@ async def run_runner_with_cancel(
     # Session completion summary
     duration = time.monotonic() - start_time
     event_count = edits.stream.event_count if edits.stream else 0
+    # #333 Task 4b: render the per-reason suppression counter as a stable
+    # comma-separated string (e.g. ``expected_wait:4,post_result:3``) so
+    # log audits can grep without parsing nested JSON.
+    suppression_counts = getattr(edits.stream, "stall_suppression_counts", None) or {}
+    suppression_summary = ",".join(
+        f"{k}:{v}" for k, v in sorted(suppression_counts.items())
+    )
     logger.info(
         "session.summary",
         session_id=outcome.resume.value if outcome.resume else None,
@@ -2079,10 +2804,13 @@ async def run_runner_with_cancel(
         duration_seconds=round(duration, 1),
         event_count=event_count,
         stall_warnings=edits._total_stall_warn_count,
+        # #494: subprocess-health canary, separate from user-facing stall_warnings
+        liveness_stalls=edits.stream.liveness_stalls if edits.stream else 0,
         peak_idle_seconds=round(edits._peak_idle, 1),
         last_event_type=edits.stream.last_event_type if edits.stream else None,
         cancelled=outcome.cancelled,
         ok=outcome.completed.ok if outcome.completed else None,
+        stall_suppressions=suppression_summary,
     )
     if event_count == 0 and not outcome.cancelled:
         logger.warning(
@@ -2172,16 +2900,31 @@ async def handle_message(
     runner_text = _strip_resume_lines(incoming.text, is_resume_line=resume_strip)
     runner_text = _apply_preamble(runner_text)
 
-    progress_tracker = ProgressTracker(engine=runner.engine)
+    progress_tracker = ProgressTracker(engine=runner.engine, clock=clock)
     # rc4 (#271): seed trigger source into meta so the footer renders it.
     # The engine's own StartedEvent.meta merges onto this via note_event.
+    # rc6 (#271 follow-up): also render `at:<token>` from /at-scheduled runs
+    # with the alarm-clock icon — semantically a one-shot delayed cron.
     if context is not None and context.trigger_source:
         icon = (
             "\N{ALARM CLOCK}"
-            if context.trigger_source.startswith("cron:")
+            if context.trigger_source.startswith(("cron:", "at:"))
             else "\N{HIGH VOLTAGE SIGN}"
         )
         progress_tracker.meta = {"trigger": f"{icon} {context.trigger_source}"}
+
+    # #269: refresh progress settings on the default presenter so edits
+    # to [progress].max_actions / [progress].verbosity in untether.toml
+    # apply on the next run. Per-chat /verbose overrides downstream of
+    # _resolve_presenter() construct a fresh formatter from these refreshed
+    # values, so the override picks up the new defaults too.
+    progress_cfg = _load_progress_settings()
+    refresh = getattr(cfg.presenter, "refresh_progress_settings", None)
+    if callable(refresh):
+        try:
+            refresh(progress_cfg)
+        except Exception:  # noqa: BLE001
+            logger.debug("progress_settings.refresh_failed", exc_info=True)
 
     # Resolve effective presenter: check for per-chat verbose override
     effective_presenter = _resolve_presenter(cfg.presenter, incoming.channel_id)
@@ -2215,7 +2958,11 @@ async def handle_message(
         resume_formatter=runner.format_resume,
         context_line=context_line,
         thread_id=incoming.thread_id,
-        min_render_interval=cfg.min_render_interval,
+        # #269: read live each run so edits to [progress].min_render_interval
+        # apply on the next message without restart. cfg.min_render_interval
+        # is the startup snapshot and only used as fallback if the live load
+        # fails.
+        min_render_interval=progress_cfg.min_render_interval,
     )
 
     # Apply watchdog settings to runner and edits
@@ -2236,10 +2983,18 @@ async def handle_message(
         edits._stuck_after_tool_result_recovery_delay = (
             watchdog.stuck_after_tool_result_recovery_delay
         )
+        # #481: bash grace window for the stall_bash_grace_suppressed branch.
+        edits._bash_grace_seconds = watchdog.bash_grace_seconds
         if hasattr(runner, "_LIVENESS_TIMEOUT_SECONDS"):
             runner._LIVENESS_TIMEOUT_SECONDS = watchdog.liveness_timeout
         if hasattr(runner, "_stall_auto_kill"):
             runner._stall_auto_kill = watchdog.stall_auto_kill
+
+    # #481: heartbeat tick cadence — drives the long-running-action elapsed
+    # tail and the post-result closing-message poller. Read live so config
+    # reloads pick up new values on the next message (matches min_render_interval
+    # pattern above).
+    edits._heartbeat_interval = progress_cfg.heartbeat_interval
 
     running_task: RunningTask | None = None
     if running_tasks is not None and progress_ref is not None:
@@ -2410,12 +3165,64 @@ async def handle_message(
             attempt=_auto_continued_count + 1,
             max_retries=ac_settings.max_retries,
         )
-        notice = (
-            "\u26a0\ufe0f Auto-continuing \u2014 "
-            "Claude stopped before processing tool results"
-        )
-        if _auto_continued_count > 0:
-            notice += f" (attempt {_auto_continued_count + 1})"
+
+        # #551 Tier 0: deliver outbox files from subprocess 1 BEFORE
+        # subprocess 2 spawns. Without this, any files the agent wrote
+        # to ``.untether-outbox/`` during the stuck-after-tool-results
+        # window are orphaned (subprocess 2 starts fresh and the
+        # original outbox is never scanned). ~3.6% silent loss observed
+        # on lba-1 before this fix. Failure to deliver must NOT block
+        # auto-continue itself \u2014 the recovery is more important than
+        # any single batch of files.
+        if cfg.send_file is not None and cfg.outbox_config is not None:
+            from .telegram.outbox_delivery import deliver_outbox_files
+            from .utils.paths import get_run_base_dir
+
+            _run_root = get_run_base_dir()
+            if _run_root is not None:
+                _oc = cfg.outbox_config
+                try:
+                    result = await deliver_outbox_files(
+                        send_file=cfg.send_file,
+                        channel_id=incoming.channel_id,
+                        thread_id=incoming.thread_id,
+                        reply_to_msg_id=user_ref.message_id,
+                        run_root=_run_root,
+                        outbox_dir=_oc.outbox_dir,
+                        deny_globs=_oc.deny_globs,
+                        max_download_bytes=_oc.max_download_bytes,
+                        max_files=_oc.outbox_max_files,
+                        cleanup=True,  # subprocess 2 starts fresh
+                    )
+                    logger.info(
+                        "outbox.delivered_pre_auto_continue",
+                        sent=len(result.sent),
+                        skipped=len(result.skipped),
+                        cleaned=result.cleaned,
+                    )
+                    # #524 rc20 follow-up: surface skipped items from the
+                    # pre-auto-continue scan too. Without this, agents that
+                    # write a directory (e.g. ``guides/``) and then hit the
+                    # stuck-after-tool-results recovery never tell the user
+                    # the deliverable existed — the directory is left in
+                    # place for subprocess 2 to re-find, but the user sees
+                    # nothing in chat about the first attempt.
+                    await _surface_outbox_skipped(
+                        cfg,
+                        incoming,
+                        user_ref,
+                        result.skipped,
+                        _oc,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "outbox.auto_continue_delivery_failed", exc_info=True
+                    )
+
+        # #551 Tier 1: reworded notice signals recovery, not failure.
+        # The \ud83d\udd01 prefix distinguishes auto-resume from a fresh start
+        # and discourages users from /cancel-ing the salvage.
+        notice = _format_auto_continue_notice(_auto_continued_count)
         notice_msg = RenderedMessage(text=notice, extra={})
         await cfg.transport.send(
             channel_id=incoming.channel_id,
@@ -2449,25 +3256,13 @@ async def handle_message(
         return
     # --- End auto-continue ---
 
+    # #510: ``completed.answer`` already has the #508 ExitPlanMode
+    # plan-body prepend applied at the runner level (claude.py, on the
+    # per-stream path). The previous bridge-side prepend read
+    # ``runner.current_stream`` — a shared singleton on the ClaudeRunner
+    # — and leaked one chat's plan body into another concurrent chat's
+    # final answer.
     final_answer = completed.answer
-
-    # If there's a plan outline stored in a synthetic warning action,
-    # prepend it to the final answer so the user can read it.
-    # (The progress message that showed the outline gets replaced by
-    # the final message, so the outline would otherwise be lost.)
-    _outline_prefix = "Plan outline:\n"
-    for _action_state in progress_tracker.snapshot(
-        resume_formatter=runner.format_resume,
-        context_line=None,
-    ).actions:
-        _title = _action_state.action.title or ""
-        if _action_state.action.kind == "warning" and _title.startswith(
-            _outline_prefix
-        ):
-            _outline_body = _title[len(_outline_prefix) :]
-            if _outline_body.strip():
-                final_answer = f"{_outline_body}\n\n{final_answer}"
-            break
 
     # Auto-clear broken session: if a resumed run failed with 0 turns,
     # clear the saved session so the next message starts fresh.
@@ -2550,6 +3345,7 @@ async def handle_message(
         engine=runner.engine,
         actions=progress_tracker.action_count,
         duration_ms=int(elapsed * 1000),
+        triggered=bool(context and context.trigger_source),
     )
     sync_resume_token(progress_tracker, completed.resume or outcome.resume)
 
@@ -2651,30 +3447,62 @@ async def handle_message(
         session_key = f"{incoming.channel_id}:{progress_ref.message_id}"
         unregister_progress(_PROGRESS_PERSISTENCE_PATH, session_key)
 
-    # Deliver outbox files (agent-initiated file delivery)
-    if (
-        cfg.send_file is not None
-        and cfg.outbox_config is not None
-        and run_ok is not False
-    ):
-        from .telegram.outbox_delivery import deliver_outbox_files
+    # Deliver outbox files (agent-initiated file delivery).
+    # #524 rc20 follow-up: surface skipped items even when run_ok is False.
+    # Delivery of *sent* files still requires a successful run (failures
+    # may leave the outbox in a partially-written state), but the user
+    # should always learn what the agent intended to send.
+    if cfg.send_file is not None and cfg.outbox_config is not None:
+        from .telegram.outbox_delivery import (
+            OutboxResult,
+            deliver_outbox_files,
+            scan_outbox,
+        )
         from .utils.paths import get_run_base_dir
 
         _run_root = get_run_base_dir()
         if _run_root is not None:
             _oc = cfg.outbox_config
-            try:
-                await deliver_outbox_files(
-                    send_file=cfg.send_file,
-                    channel_id=incoming.channel_id,
-                    thread_id=incoming.thread_id,
-                    reply_to_msg_id=user_ref.message_id,
-                    run_root=_run_root,
-                    outbox_dir=_oc.outbox_dir,
-                    deny_globs=_oc.deny_globs,
-                    max_download_bytes=_oc.max_download_bytes,
-                    max_files=_oc.outbox_max_files,
-                    cleanup=_oc.outbox_cleanup,
+            _outbox_result: OutboxResult | None = None
+            if run_ok is not False:
+                try:
+                    _outbox_result = await deliver_outbox_files(
+                        send_file=cfg.send_file,
+                        channel_id=incoming.channel_id,
+                        thread_id=incoming.thread_id,
+                        reply_to_msg_id=user_ref.message_id,
+                        run_root=_run_root,
+                        outbox_dir=_oc.outbox_dir,
+                        deny_globs=_oc.deny_globs,
+                        max_download_bytes=_oc.max_download_bytes,
+                        max_files=_oc.outbox_max_files,
+                        cleanup=_oc.outbox_cleanup,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning("outbox.delivery_failed", exc_info=True)
+                    _outbox_result = None
+            else:
+                # Failed run: skip file delivery but still scan so the user
+                # gets the 📎 Outbox skipped notice for any directory or
+                # blocked entry the agent left behind.
+                try:
+                    _, _failed_skipped = scan_outbox(
+                        _run_root,
+                        outbox_dir=_oc.outbox_dir,
+                        deny_globs=_oc.deny_globs,
+                        max_download_bytes=_oc.max_download_bytes,
+                        max_files=_oc.outbox_max_files,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug("outbox.failed_run_scan_error", exc_info=True)
+                    _failed_skipped = []
+                _outbox_result = OutboxResult(skipped=_failed_skipped)
+
+            if _outbox_result is not None:
+                await _surface_outbox_skipped(
+                    cfg,
+                    incoming,
+                    user_ref,
+                    _outbox_result.skipped,
+                    _oc,
                 )
-            except Exception:  # noqa: BLE001
-                logger.warning("outbox.delivery_failed", exc_info=True)

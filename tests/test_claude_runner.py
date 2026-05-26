@@ -1,4 +1,8 @@
+import contextlib
 import json
+import signal
+import time
+from datetime import UTC
 from pathlib import Path
 from typing import cast
 
@@ -173,6 +177,125 @@ def test_prespawn_ram_guard_warn_only_does_not_block(
 
 
 # ---------------------------------------------------------------------------
+# #478 / #205 — claude runner.start log must NOT carry prompt content at INFO
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_runner_start_does_not_log_prompt_at_info(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#478: ClaudeRunner.run_impl emits ``runner.start`` at INFO with only
+    ``prompt_len`` + ``args`` (no ``prompt`` field). The prompt preview
+    moves to a DEBUG ``runner.start_prompt`` companion event so credentials
+    or PII never surface at the broadly-accessible INFO tier (#205).
+    Regression-locks the duplicate INFO call inside the claude override
+    that was missed when the base runner was fixed.
+    """
+    from structlog.testing import capture_logs
+
+    class _BoomManager:
+        async def __aenter__(self) -> object:
+            raise RuntimeError("stop_after_log")
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    def fake_manage_subprocess(*args: object, **kwargs: object) -> _BoomManager:
+        _ = args, kwargs
+        return _BoomManager()
+
+    monkeypatch.setattr(claude_runner, "manage_subprocess", fake_manage_subprocess)
+
+    # Force control-channel mode (production default). Without a
+    # permission_mode, build_args falls back to legacy ``-p <prompt>``
+    # which puts the prompt into argv — covered separately below.
+    runner = ClaudeRunner(claude_cmd="claude", permission_mode="acceptEdits")
+    # Distinctive sentinel that won't collide with legitimate env var names
+    # (e.g., GEMINI_API_KEY) which appear redacted in args=[...].
+    sentinel = "ZAPHOD-PROMPT-SECRET-XYZZY-9876"
+    secret_prompt = f"sensitive content: {sentinel} run my task"
+
+    with capture_logs() as logs, contextlib.suppress(RuntimeError):
+        async for _evt in runner.run_impl(secret_prompt, None):
+            pass
+
+    start_events = [r for r in logs if r.get("event") == "runner.start"]
+    assert start_events, "runner.start INFO event must fire"
+    for record in start_events:
+        # Prompt content must NOT appear in the INFO log under any field name.
+        assert "prompt" not in record, (
+            f"runner.start at INFO leaked 'prompt' field: {record!r}"
+        )
+        assert "prompt_preview" not in record
+        # But length should be there for ops visibility.
+        assert record.get("prompt_len") == len(secret_prompt)
+        # ``args`` is part of the base-runner contract — claude override
+        # should mirror it so subprocess invocation is visible.
+        assert "args" in record
+        # The literal prompt sentinel must not appear anywhere in the record.
+        assert sentinel not in str(record), (
+            f"runner.start INFO leaked prompt sentinel: {record!r}"
+        )
+        # And `env -i KEY=VAL` pairs in args must be redacted (#361) so
+        # secrets passed via env-wrap don't surface even when ``args`` is
+        # logged. Spot-check on a known-redacted name from the env policy.
+        args_str = str(record.get("args"))
+        if "BWS_ACCESS_TOKEN" in args_str:
+            assert "BWS_ACCESS_TOKEN=***" in args_str, (
+                f"env -i pair should be redacted: {args_str}"
+            )
+
+
+@pytest.mark.anyio
+async def test_runner_start_redacts_legacy_mode_prompt_in_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#478: in legacy ``-p <prompt>`` mode (no permission_mode set), the
+    prompt sits as the last argv element after ``--``. The runner.start INFO
+    log must redact at the ``--`` boundary so prompt content still doesn't
+    reach INFO. Covers the path where _effective_permission_mode() is None.
+    """
+    from structlog.testing import capture_logs
+
+    class _BoomManager:
+        async def __aenter__(self) -> object:
+            raise RuntimeError("stop_after_log")
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    def fake_manage_subprocess(*args: object, **kwargs: object) -> _BoomManager:
+        _ = args, kwargs
+        return _BoomManager()
+
+    monkeypatch.setattr(claude_runner, "manage_subprocess", fake_manage_subprocess)
+
+    # No permission_mode → legacy ``-p`` path, prompt lands in argv.
+    runner = ClaudeRunner(claude_cmd="claude")
+    sentinel = "ZAPHOD-LEGACY-SECRET-XYZZY-9876"
+    secret_prompt = f"top-secret legacy: {sentinel} run the task"
+
+    with capture_logs() as logs, contextlib.suppress(RuntimeError):
+        async for _evt in runner.run_impl(secret_prompt, None):
+            pass
+
+    start_events = [r for r in logs if r.get("event") == "runner.start"]
+    assert start_events, "runner.start INFO event must fire"
+    for record in start_events:
+        # The literal prompt sentinel must NOT leak through args.
+        assert sentinel not in str(record), (
+            f"runner.start INFO leaked prompt sentinel via legacy args: {record!r}"
+        )
+        args = record.get("args") or []
+        # Legacy mode appends ``--`` then the prompt; we replace the prompt
+        # with a placeholder string so reviewers can still tell the run was
+        # in legacy mode without exposing prompt content.
+        assert "--" in args
+        assert "<prompt redacted>" in args
+
+
+# ---------------------------------------------------------------------------
 # #347 — background-task tracking (Monitor / Bash-bg / Agent-bg /
 # ScheduleWakeup / RemoteTrigger)
 # ---------------------------------------------------------------------------
@@ -314,6 +437,58 @@ def test_schedule_wakeup_tracked_with_deadline() -> None:
         factory=state.factory,
     )
     assert "toolu_W1" in state.live_wakeups
+
+
+def test_schedule_wakeup_reads_delaySeconds_field() -> None:
+    """#481: real Claude Code stream-json emits ``delaySeconds`` (#289).
+
+    Previous code only read ``delay_ms``/``timeout_ms`` so production
+    deadlines fell to 0.0 (countdown rendering broken). Verify the new
+    code path: a 60s wakeup yields a ``deadline`` ~60s in the future.
+    """
+    import time
+
+    state = ClaudeStreamState()
+    before = time.monotonic()
+    translate_claude_event(
+        _decode_event(
+            _make_tool_use_event("ScheduleWakeup", "toolu_W2", {"delaySeconds": 60})
+        ),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    after = time.monotonic()
+    deadline = state.live_wakeups["toolu_W2"]
+    # 60s wakeup → deadline between (before + 60) and (after + 60).
+    assert before + 60.0 <= deadline <= after + 60.0
+
+
+def test_schedule_wakeup_delay_ms_fallback_still_works() -> None:
+    """Backward-compat: delay_ms fallback still produces a valid deadline."""
+    import time
+
+    state = ClaudeStreamState()
+    before = time.monotonic()
+    translate_claude_event(
+        _decode_event(
+            _make_tool_use_event("ScheduleWakeup", "toolu_W3", {"delay_ms": 30_000})
+        ),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    deadline = state.live_wakeups["toolu_W3"]
+    # 30s wakeup via delay_ms fallback.
+    assert before + 30.0 <= deadline <= time.monotonic() + 30.0
+
+
+def test_post_result_closing_state_initial_values() -> None:
+    """#470: ClaudeStreamState carries the new closing-message signal fields."""
+    state = ClaudeStreamState()
+    assert state.post_result_closed_at is None
+    assert state.post_result_idle_minutes == 0.0
+    assert state.post_result_closing_sent is False
 
 
 def test_remote_trigger_tracked_as_set_member() -> None:
@@ -514,11 +689,18 @@ def test_catalog_staleness_disabled_emits_no_warning() -> None:
     assert state.initial_mcp_servers == [{"name": "pal", "status": "failed"}]
 
 
-def test_tool_result_queues_mcp_status_when_notify_enabled() -> None:
-    """With notify_catalog_refresh on, each tool_result batch queues one request."""
+def test_tool_result_queues_mcp_status_when_notify_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With notify_catalog_refresh on, each tool_result batch queues one request
+    once the per-session debounce window has elapsed (#497)."""
     state = ClaudeStreamState()
     state.notify_catalog_refresh = True
     state.factory._resume = ResumeToken(engine=ENGINE, value="sess-5")
+
+    # Drive monotonic time deterministically to skip past the 5s debounce.
+    fake_now = [1000.0]
+    monkeypatch.setattr(claude_runner.time, "monotonic", lambda: fake_now[0])
 
     translate_claude_event(
         _decode_event(_make_tool_result_event("toolu_1")),
@@ -529,15 +711,86 @@ def test_tool_result_queues_mcp_status_when_notify_enabled() -> None:
     assert len(state.pending_catalog_refresh_ids) == 1
     assert state.pending_catalog_refresh_ids[0].startswith("ut_catalog_refresh_sess-5_")
 
+    fake_now[0] += state.catalog_refresh_min_interval_s + 0.1
     translate_claude_event(
         _decode_event(_make_tool_result_event("toolu_2")),
         title="claude",
         state=state,
         factory=state.factory,
     )
-    # Second batch queues a second distinct ID
+    # Second batch queues a second distinct ID after debounce elapses
     assert len(state.pending_catalog_refresh_ids) == 2
     assert state.pending_catalog_refresh_ids[0] != state.pending_catalog_refresh_ids[1]
+
+
+def test_tool_result_debounces_back_to_back_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#497: rapid-fire tool_results within the debounce window yield ONE refresh.
+
+    Reproduces the conditions of the 'scout' storm (count=183) — without the
+    debounce, every tool_result batch queues a fresh request. With it, only
+    the first batch in each interval window fires.
+    """
+    state = ClaudeStreamState()
+    state.notify_catalog_refresh = True
+    state.catalog_refresh_min_interval_s = 5.0
+    state.factory._resume = ResumeToken(engine=ENGINE, value="sess-debounce")
+
+    fake_now = [2000.0]
+    monkeypatch.setattr(claude_runner.time, "monotonic", lambda: fake_now[0])
+
+    # Fire 10 tool_result batches 100 ms apart — all within the 5 s window.
+    for i in range(10):
+        translate_claude_event(
+            _decode_event(_make_tool_result_event(f"toolu_burst_{i}")),
+            title="claude",
+            state=state,
+            factory=state.factory,
+        )
+        fake_now[0] += 0.1
+
+    assert len(state.pending_catalog_refresh_ids) == 1, (
+        f"Expected 1 refresh queued under debounce, got "
+        f"{len(state.pending_catalog_refresh_ids)} — debounce broken"
+    )
+    first_ts = state.last_catalog_refresh_queued_at
+    assert first_ts == 2000.0
+
+    # Advance past the window — the next tool_result fires a second refresh.
+    fake_now[0] = 2000.0 + 5.0 + 0.05
+    translate_claude_event(
+        _decode_event(_make_tool_result_event("toolu_after_window")),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    assert len(state.pending_catalog_refresh_ids) == 2
+    assert state.last_catalog_refresh_queued_at == 2005.05
+
+
+def test_tool_result_debounce_disabled_with_zero_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#497: catalog_refresh_min_interval_s = 0 restores pre-debounce behaviour."""
+    state = ClaudeStreamState()
+    state.notify_catalog_refresh = True
+    state.catalog_refresh_min_interval_s = 0.0
+    state.factory._resume = ResumeToken(engine=ENGINE, value="sess-no-debounce")
+
+    fake_now = [3000.0]
+    monkeypatch.setattr(claude_runner.time, "monotonic", lambda: fake_now[0])
+
+    for i in range(5):
+        translate_claude_event(
+            _decode_event(_make_tool_result_event(f"toolu_z_{i}")),
+            title="claude",
+            state=state,
+            factory=state.factory,
+        )
+        fake_now[0] += 0.01
+
+    assert len(state.pending_catalog_refresh_ids) == 5
 
 
 def test_tool_result_does_not_queue_when_notify_disabled() -> None:
@@ -889,6 +1142,117 @@ def test_translate_rate_limit_event_handles_missing_retry() -> None:
     assert state.rate_limit_total_s == 0.0
 
 
+def test_translate_rate_limit_event_derives_retry_after_from_reset_ts() -> None:
+    """#518: when `retry_after_ms` is missing but `requests_reset` is present
+    as an ISO timestamp, derive `retry_after_s` from the reset window. This
+    is the subscription-cap pattern the rc13 audit observed — bare events
+    that left users with no actionable wait time."""
+    from datetime import datetime, timedelta
+
+    state = ClaudeStreamState()
+    # Reset 90 seconds from now
+    reset_ts = (datetime.now(UTC) + timedelta(seconds=90)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    events = translate_claude_event(
+        _decode_event(
+            {
+                "type": "rate_limit_event",
+                "rate_limit_info": {"requests_reset": reset_ts},
+            }
+        ),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    assert len(events) == 2
+    # Should now show "retrying in Ns" (not the generic "waiting to retry"),
+    # and cumulative should accumulate the derived seconds.
+    assert "retrying in" in events[0].action.title
+    assert state.rate_limit_count == 1
+    # Allow ±2s wiggle for clock drift between the test's setup and translate
+    assert 88 <= state.rate_limit_total_s <= 92, (
+        f"Expected ~90s cumulative, got {state.rate_limit_total_s}"
+    )
+
+
+def test_translate_rate_limit_event_prefers_earlier_reset_when_both_present() -> None:
+    """#518: when both `requests_reset` and `tokens_reset` are present, derive
+    from the EARLIER of the two — the rate limit lifts as soon as either
+    budget refills."""
+    from datetime import datetime, timedelta
+
+    state = ClaudeStreamState()
+    now = datetime.now(UTC)
+    earlier = (now + timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    later = (now + timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    events = translate_claude_event(
+        _decode_event(
+            {
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "requests_reset": later,
+                    "tokens_reset": earlier,
+                },
+            }
+        ),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    assert len(events) == 2
+    # Should pick ~30s, not ~600s
+    assert 28 <= state.rate_limit_total_s <= 32, (
+        f"Expected ~30s (earlier reset), got {state.rate_limit_total_s}"
+    )
+
+
+def test_translate_rate_limit_event_retry_after_ms_takes_precedence() -> None:
+    """#518: explicit `retry_after_ms` is preferred over derived reset_ts so we
+    don't double-account or override the upstream value."""
+    from datetime import datetime, timedelta
+
+    state = ClaudeStreamState()
+    # retry_after_ms says 10s, reset_ts says 60s — we should use 10s
+    later = (datetime.now(UTC) + timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    events = translate_claude_event(
+        _decode_event(
+            {
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "retry_after_ms": 10_000,
+                    "requests_reset": later,
+                },
+            }
+        ),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    assert len(events) == 2
+    assert state.rate_limit_total_s == 10.0
+
+
+def test_translate_rate_limit_event_handles_unparseable_reset_ts() -> None:
+    """#518: garbage `requests_reset` is silently ignored — we fall back to the
+    "waiting to retry" copy rather than crashing the runner."""
+    state = ClaudeStreamState()
+    events = translate_claude_event(
+        _decode_event(
+            {
+                "type": "rate_limit_event",
+                "rate_limit_info": {"requests_reset": "not-a-timestamp"},
+            }
+        ),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    assert len(events) == 2
+    assert "waiting to retry" in events[0].action.title
+    assert state.rate_limit_total_s == 0.0
+
+
 def test_translate_thinking_block() -> None:
     state = ClaudeStreamState()
     event = {
@@ -918,6 +1282,361 @@ def test_translate_thinking_block() -> None:
     assert events[0].action.kind == "note"
     assert events[0].action.title == "Consider the options."
     assert events[0].ok is True
+
+
+# ---------------------------------------------------------------------------
+# #489 — server_tool_use + advisor_tool_result content blocks (regression)
+# ---------------------------------------------------------------------------
+
+
+def test_translate_server_tool_use_block() -> None:
+    """server_tool_use shares the tool_use translation path: emits an
+    action_started, populates state.pending_actions, and stamps
+    state.last_tool_use_id. Regression for #489 — previously msgspec
+    rejected the whole JSONL line and the event was silently dropped."""
+    state = ClaudeStreamState()
+    event = {
+        "type": "assistant",
+        "message": {
+            "id": "msg_1",
+            "content": [
+                {
+                    "type": "server_tool_use",
+                    "id": "stu_01",
+                    "name": "web_search",
+                    "input": {"query": "untether telegram"},
+                }
+            ],
+        },
+    }
+
+    events = translate_claude_event(
+        _decode_event(event),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+
+    assert len(events) == 1
+    assert isinstance(events[0], ActionEvent)
+    assert events[0].phase == "started"
+    assert events[0].action.id == "stu_01"
+    assert "stu_01" in state.pending_actions
+    assert state.last_tool_use_id == "stu_01"
+
+
+def test_translate_exitplanmode_captures_plan_body() -> None:
+    """#508 — translating a tool_use(name='ExitPlanMode', input.plan='...')
+    captures the plan body onto state.last_exitplanmode_plan so the bridge
+    can re-emit it in the final answer if the post-approval result is
+    brief.  Regression for the live research-task short-final-message bug.
+    """
+    state = ClaudeStreamState()
+    state.factory._resume = ResumeToken(engine="claude", value="sess-508")
+    plan_body = (
+        "Findings:\n"
+        "- File X has bug Y at line 42\n"
+        "- File Z is unaffected\n"
+        "- Recommend fix A\n"
+    )
+    event = {
+        "type": "assistant",
+        "message": {
+            "id": "msg_1",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "tu_epm_1",
+                    "name": "ExitPlanMode",
+                    "input": {"plan": plan_body},
+                }
+            ],
+        },
+    }
+
+    translate_claude_event(
+        _decode_event(event),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+
+    assert state.last_exitplanmode_plan == plan_body
+
+
+def test_translate_exitplanmode_ignores_empty_plan_body() -> None:
+    """#508 — empty/whitespace-only plan bodies are NOT captured. Avoids
+    overwriting a real prior value with an inadvertent retry/empty call."""
+    state = ClaudeStreamState()
+    state.factory._resume = ResumeToken(engine="claude", value="sess-508")
+    state.last_exitplanmode_plan = "earlier plan body"
+    event = {
+        "type": "assistant",
+        "message": {
+            "id": "msg_2",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "tu_epm_2",
+                    "name": "ExitPlanMode",
+                    "input": {"plan": "   "},
+                }
+            ],
+        },
+    }
+
+    translate_claude_event(
+        _decode_event(event),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+
+    assert state.last_exitplanmode_plan == "earlier plan body"
+
+
+def test_translate_result_prepends_exitplanmode_plan_into_answer() -> None:
+    """#510: the ExitPlanMode plan body re-emit happens HERE on the per-stream
+    result path (claude.py), not in runner_bridge against the singleton
+    runner.current_stream. Verifies the prepend uses state.last_exitplanmode_plan
+    from the SAME state instance that received the result event.
+    """
+    state = ClaudeStreamState()
+    state.factory._resume = ResumeToken(engine="claude", value="sess-510")
+    state.last_exitplanmode_plan = "- Finding 1\n- Finding 2\n- Recommend X"
+    short_post_approval_result = "Plan approved — see file."
+
+    event = claude_schema.StreamResultMessage(
+        subtype="success",
+        duration_ms=100,
+        duration_api_ms=50,
+        is_error=False,
+        num_turns=2,
+        session_id="sess-510",
+        result=short_post_approval_result,
+    )
+    events = translate_claude_event(
+        event,
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    completed = [evt for evt in events if isinstance(evt, CompletedEvent)]
+    assert len(completed) == 1
+    answer = completed[0].answer
+    assert "📋 Plan (approved):" in answer
+    assert "- Finding 1" in answer
+    assert short_post_approval_result in answer
+    # Plan body comes before the brief post-approval text
+    assert answer.index("- Finding 1") < answer.index(short_post_approval_result)
+
+
+def test_concurrent_states_do_not_leak_exitplanmode_plan_bodies() -> None:
+    """#510 regression — the live bug. Two concurrent Claude sessions
+    each had their own ClaudeStreamState. Previously the bridge read the
+    plan body from ``runner.current_stream`` (a shared singleton on the
+    runner), which was overwritten when either session re-entered
+    run_impl. The fix routes the prepend through the per-stream
+    translate path, so each state can ONLY ever read its own plan body.
+
+    Models the production incident: chat A captured "PLAN — CHANNELO
+    TUNNEL" on its state, chat B was completing a different task with
+    its own short answer — chat B's CompletedEvent must NOT contain
+    chat A's plan body.
+    """
+    state_a = ClaudeStreamState()
+    state_a.factory._resume = ResumeToken(engine="claude", value="sess-A")
+    state_a.last_exitplanmode_plan = "PLAN — CHANNELO TUNNEL secret content"
+
+    state_b = ClaudeStreamState()
+    state_b.factory._resume = ResumeToken(engine="claude", value="sess-B")
+    # state_b has its own (smaller) plan body — different content
+    state_b.last_exitplanmode_plan = "PLAN — legal-DB handover"
+
+    # Session B completes with a brief post-approval result.
+    event_b = claude_schema.StreamResultMessage(
+        subtype="success",
+        duration_ms=100,
+        duration_api_ms=50,
+        is_error=False,
+        num_turns=2,
+        session_id="sess-B",
+        result="done",
+    )
+    events_b = translate_claude_event(
+        event_b,
+        title="claude",
+        state=state_b,
+        factory=state_b.factory,
+    )
+    completed_b = next(evt for evt in events_b if isinstance(evt, CompletedEvent))
+
+    # Session B's answer must only contain its own plan body.
+    assert "PLAN — legal-DB handover" in completed_b.answer
+    assert "CHANNELO TUNNEL" not in completed_b.answer
+    assert "secret content" not in completed_b.answer
+
+
+def test_translate_result_error_does_not_prepend_plan(monkeypatch) -> None:
+    """#510: only the OK path prepends. Errored result paths flow into
+    _extract_error and must not also receive a plan-body prepend.
+    """
+    state = ClaudeStreamState()
+    state.factory._resume = ResumeToken(engine="claude", value="sess-510-err")
+    state.last_exitplanmode_plan = "- Should not appear"
+
+    event = claude_schema.StreamResultMessage(
+        subtype="error_during_execution",
+        duration_ms=100,
+        duration_api_ms=50,
+        is_error=True,
+        num_turns=1,
+        session_id="sess-510-err",
+    )
+    events = translate_claude_event(
+        event,
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    completed = next(evt for evt in events if isinstance(evt, CompletedEvent))
+    assert "📋 Plan (approved):" not in (completed.answer or "")
+    assert "- Should not appear" not in (completed.answer or "")
+
+
+def test_translate_result_skips_prepend_when_answer_substantive() -> None:
+    """#515: when the post-approval text is already a substantive
+    CLI-style summary (≥ ``_PREPEND_LENGTH_GATE`` chars), Layer E must
+    NOT prepend the plan body. Without this gate the rc11/rc12 fix
+    concatenated plan body + paraphrased summary on every well-behaved
+    run, producing 25k-42k char Telegram finals on staging.
+    """
+    from untether.runners.claude import _PREPEND_LENGTH_GATE
+
+    state = ClaudeStreamState()
+    state.factory._resume = ResumeToken(engine="claude", value="sess-515")
+    state.last_exitplanmode_plan = "- Plan finding 1\n- Plan finding 2"
+
+    # A real CLI-style summary, just above the gate. Claude paraphrases
+    # rather than literal-copies, so the substring check would fail —
+    # the length gate is what stops the double-ship.
+    summary = (
+        "Investigation complete. Here is what I found:\n\n"
+        "- Module X had a regression introduced in commit abc123\n"
+        "- The root cause was a missing null guard in the parser\n"
+        "- Rolled back the change and added a regression test\n"
+        "- Next step: backfill the affected rows on Monday morning\n\n"
+        "Decisions made: kept the legacy code path for one more release cycle\n"
+        "to give downstream consumers time to migrate; full removal scheduled\n"
+        "for the next minor version once telemetry confirms zero active\n"
+        "callers. Telegram message size budget respected (under 1500 chars).\n\n"
+        "Next steps: open a follow-up issue to track the backfill timeline,\n"
+        "send a heads-up in the team channel about the rollback, and re-run\n"
+        "the daily-audit cron tomorrow morning to confirm the regression has\n"
+        "cleared the verification window before closing this thread.\n"
+    )
+    assert len(summary) >= _PREPEND_LENGTH_GATE
+
+    event = claude_schema.StreamResultMessage(
+        subtype="success",
+        duration_ms=100,
+        duration_api_ms=50,
+        is_error=False,
+        num_turns=2,
+        session_id="sess-515",
+        result=summary,
+    )
+    events = translate_claude_event(
+        event,
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    completed = next(evt for evt in events if isinstance(evt, CompletedEvent))
+    assert completed.answer == summary
+    assert "📋 Plan (approved):" not in completed.answer
+
+
+def test_translate_result_caps_long_plan_body_when_prepending() -> None:
+    """#515: when Layer E does fire (short post-approval answer), an
+    over-long captured plan body must be truncated to
+    ``_PREPEND_BODY_CAP`` chars + a truncation marker. Without this cap
+    a 30k-char plan body still ships a 30k-char Telegram final even
+    after the length gate is added.
+    """
+    from untether.runners.claude import _PREPEND_BODY_CAP
+
+    state = ClaudeStreamState()
+    state.factory._resume = ResumeToken(engine="claude", value="sess-515-cap")
+    state.last_exitplanmode_plan = "x" * (_PREPEND_BODY_CAP + 2000)
+
+    event = claude_schema.StreamResultMessage(
+        subtype="success",
+        duration_ms=100,
+        duration_api_ms=50,
+        is_error=False,
+        num_turns=2,
+        session_id="sess-515-cap",
+        result="ok",
+    )
+    events = translate_claude_event(
+        event,
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    completed = next(evt for evt in events if isinstance(evt, CompletedEvent))
+    assert "📋 Plan (approved):" in completed.answer
+    assert "plan truncated" in completed.answer
+    # Final answer should not contain the full 3500-char plan body.
+    assert "x" * (_PREPEND_BODY_CAP + 100) not in completed.answer
+
+
+def test_translate_advisor_tool_result_block() -> None:
+    """advisor_tool_result shares the tool_result translation path: emits an
+    action_completed and pops the matching entry from state.pending_actions.
+    Regression for #489."""
+    state = ClaudeStreamState()
+    # Inject a pending action keyed on the tool_use_id (mirrors what would
+    # have been registered by the prior server_tool_use / tool_use call).
+    from untether.model import Action
+
+    state.pending_actions["adv_01"] = Action(
+        id="adv_01",
+        kind="tool",
+        title="advisor",
+        detail={},
+    )
+
+    event = {
+        "type": "user",
+        "message": {
+            "id": "msg_r",
+            "content": [
+                {
+                    "type": "advisor_tool_result",
+                    "tool_use_id": "adv_01",
+                    "content": "Reviewer said: looks good.",
+                    "is_error": False,
+                }
+            ],
+        },
+    }
+
+    events = translate_claude_event(
+        _decode_event(event),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+
+    assert any(
+        isinstance(e, ActionEvent)
+        and e.phase == "completed"
+        and e.action.id == "adv_01"
+        for e in events
+    )
+    assert "adv_01" not in state.pending_actions
 
 
 @pytest.mark.anyio
@@ -1250,6 +1969,142 @@ def test_extract_error_with_result_text() -> None:
 
 
 # ===========================================================================
+# #438 — Stream idle timeout Type-A vs Type-B classification
+# ===========================================================================
+
+
+def test_extract_error_type_a_stream_idle_timeout() -> None:
+    """Mid-generation stall: num_turns >= 1 and duration_api_ms > 0.
+    Surface as Type A with hint to raise the timeout."""
+    from untether.runners.claude import _extract_error
+
+    event = claude_schema.StreamResultMessage(
+        subtype="error_during_execution",
+        duration_ms=635000,
+        duration_api_ms=261086,
+        is_error=True,
+        num_turns=19,
+        session_id="36693744aaaa0000",
+        result="API Error: Stream idle timeout - partial response received",
+    )
+    result = _extract_error(event, resumed=False)
+    assert result is not None
+    assert "Type A" in result
+    assert "Mid-generation" in result
+    assert "claude_stream_idle_timeout_ms" in result
+    # Type-B language must NOT appear.
+    assert "Type B" not in result
+    assert "no bytes" not in result.lower()
+
+
+def test_extract_error_type_b_stream_idle_timeout_zero_bytes() -> None:
+    """Cold-start zero-byte stall: num_turns <= 1 and duration_api_ms == 0.
+    Surface as Type B and tell the user raising the timeout will NOT help."""
+    from untether.runners.claude import _extract_error
+
+    event = claude_schema.StreamResultMessage(
+        subtype="error_during_execution",
+        duration_ms=350000,
+        duration_api_ms=0,
+        is_error=True,
+        num_turns=1,
+        session_id="24960feabbbb0000",
+        result="API Error: Stream idle timeout - partial response received",
+    )
+    result = _extract_error(event, resumed=True)
+    assert result is not None
+    assert "Type B" in result
+    assert "Cold-start" in result
+    assert "no bytes" in result
+    assert "will NOT help" in result
+    # Type-A language must NOT appear.
+    assert "Type A" not in result
+
+
+def test_extract_error_unrelated_failure_no_classification() -> None:
+    """Non-stall errors must not gain a Type-A/B annotation."""
+    from untether.runners.claude import _extract_error
+
+    event = claude_schema.StreamResultMessage(
+        subtype="error_during_execution",
+        duration_ms=5000,
+        duration_api_ms=3000,
+        is_error=True,
+        num_turns=2,
+        session_id="abcdef1234567890",
+        result="Tool execution failed with code 1",
+    )
+    result = _extract_error(event, resumed=False)
+    assert result is not None
+    assert "Type A" not in result
+    assert "Type B" not in result
+    assert "Tool execution failed" in result
+
+
+# ===========================================================================
+# #438 — claude_stream_idle_timeout_ms config knob
+# ===========================================================================
+
+
+def test_env_stream_idle_timeout_configured_value(monkeypatch, tmp_path) -> None:
+    """[watchdog] claude_stream_idle_timeout_ms in untether.toml is honoured."""
+    monkeypatch.delenv("CLAUDE_STREAM_IDLE_TIMEOUT_MS", raising=False)
+
+    from untether import runners as untether_runners
+    from untether.settings import (
+        TelegramTransportSettings,
+        UntetherSettings,
+        WatchdogSettings,
+    )
+
+    settings = UntetherSettings(
+        transport="telegram",
+        transports={
+            "telegram": TelegramTransportSettings(
+                bot_token="test:token",
+                chat_id=12345,
+                allow_any_user=True,
+            )
+        },
+        watchdog=WatchdogSettings(claude_stream_idle_timeout_ms=600_000),
+    )
+
+    monkeypatch.setattr(
+        untether_runners.claude,
+        "load_settings_if_exists",
+        lambda: (settings, tmp_path / "untether.toml"),
+    )
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    env = runner.env(state=None)
+    assert env is not None
+    assert env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] == "600000"
+
+
+def test_env_stream_idle_timeout_settings_load_failure_falls_back(
+    monkeypatch,
+) -> None:
+    """If settings can't load, the hardcoded 300000 default still applies."""
+    monkeypatch.delenv("CLAUDE_STREAM_IDLE_TIMEOUT_MS", raising=False)
+
+    from untether import runners as untether_runners
+
+    def _boom():
+        raise RuntimeError("settings load failed")
+
+    monkeypatch.setattr(
+        untether_runners.claude,
+        "load_settings_if_exists",
+        _boom,
+    )
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    env = runner.env(state=None)
+    assert env is not None
+    assert env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] == "300000"
+
+
+# ===========================================================================
 # #361 — runtime env audit hook on system.init
 # ===========================================================================
 
@@ -1429,3 +2284,1806 @@ def test_redact_env_i_args_passthrough_when_not_env_wrapped() -> None:
 
     cmd = ["claude", "--output-format", "stream-json", "--effort", "xhigh"]
     assert redact_env_i_args(cmd) == cmd
+
+
+# ── #333 — post-result idle timeout & turn-complete UX signal ─────────────
+
+
+def test_translate_result_arms_post_result_idle_timer() -> None:
+    """A `result` event sets `state.result_received_at` for the watchdog."""
+    state = ClaudeStreamState()
+    assert state.result_received_at is None
+
+    event = claude_schema.StreamResultMessage(
+        subtype="success",
+        duration_ms=100,
+        duration_api_ms=50,
+        is_error=False,
+        num_turns=1,
+        session_id="post-result-timer-session",
+        result="done",
+    )
+    translate_claude_event(
+        event,
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    assert state.result_received_at is not None
+    assert state.result_received_at > 0
+
+
+def test_translate_result_emits_turn_complete_meta() -> None:
+    """Successful result emits supplementary StartedEvent with complete hint."""
+    state = ClaudeStreamState()
+    event = claude_schema.StreamResultMessage(
+        subtype="success",
+        duration_ms=100,
+        duration_api_ms=50,
+        is_error=False,
+        num_turns=1,
+        session_id="turn-complete-session",
+        result="done",
+    )
+    events = translate_claude_event(
+        event,
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    started = [evt for evt in events if isinstance(evt, StartedEvent)]
+    completed = [evt for evt in events if isinstance(evt, CompletedEvent)]
+    assert len(started) == 1
+    assert len(completed) == 1
+    assert started[0].meta == {"complete": "✓ turn complete"}
+    # CompletedEvent must remain the LAST event for the 3-event contract.
+    assert events[-1] is completed[0]
+
+
+def test_translate_result_skips_complete_meta_on_error() -> None:
+    """Errored result does NOT add the turn-complete meta hint."""
+    state = ClaudeStreamState()
+    event = claude_schema.StreamResultMessage(
+        subtype="error_during_execution",
+        duration_ms=100,
+        duration_api_ms=50,
+        is_error=True,
+        num_turns=1,
+        session_id="errored-session",
+    )
+    events = translate_claude_event(
+        event,
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    started = [evt for evt in events if isinstance(evt, StartedEvent)]
+    completed = [evt for evt in events if isinstance(evt, CompletedEvent)]
+    assert len(started) == 0  # no supplementary started for failures
+    assert len(completed) == 1
+    assert completed[0].ok is False
+
+
+@pytest.mark.anyio
+async def test_post_result_idle_watchdog_fires_when_clean(monkeypatch) -> None:
+    """Past the timeout with no pending approvals → stdin is closed."""
+    import anyio
+
+    from untether.runners.claude import (
+        _PENDING_ASK_REQUESTS,
+        _REQUEST_TO_SESSION,
+        ClaudeRunner,
+    )
+
+    # Ensure registries are clean.
+    _REQUEST_TO_SESSION.clear()
+    _PENDING_ASK_REQUESTS.clear()
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    state = ClaudeStreamState()
+    # Seed the factory with a resume token so the watchdog can find the sid.
+    state.factory.started(
+        ResumeToken(engine="claude", value="watchdog-clean-session"),
+    )
+    # Arm the timer: pretend the result event landed 1000s ago.
+    state.result_received_at = time.monotonic() - 1000.0
+
+    closed = anyio.Event()
+
+    class FakeStdin:
+        async def aclose(self) -> None:
+            closed.set()
+
+    fake_stdin = FakeStdin()
+    reader_done = anyio.Event()
+
+    # Patch sleep so the watchdog ticks immediately.
+    real_sleep = anyio.sleep
+
+    async def fast_sleep(s: float) -> None:
+        await real_sleep(0)
+
+    monkeypatch.setattr("untether.runners.claude.anyio.sleep", fast_sleep)
+
+    class _StubLogger:
+        def info(self, *a, **k) -> None:
+            pass
+
+        def warning(self, *a, **k) -> None:
+            pass
+
+        def debug(self, *a, **k) -> None:
+            pass
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(
+            runner._post_result_idle_watchdog,
+            state,
+            fake_stdin,
+            reader_done,
+            _StubLogger(),
+            60.0,
+        )
+        # Give the task one tick to detect the expired timer + close.
+        with anyio.move_on_after(2.0):
+            await closed.wait()
+        tg.cancel_scope.cancel()
+
+    assert closed.is_set(), "watchdog should have closed stdin"
+
+
+@pytest.mark.anyio
+async def test_post_result_idle_watchdog_defers_when_pending_approval(
+    monkeypatch,
+) -> None:
+    """An in-flight approval suppresses the close, re-arming the timer."""
+    import anyio
+
+    from untether.runners.claude import (
+        _PENDING_ASK_REQUESTS,
+        _REQUEST_TO_SESSION,
+        ClaudeRunner,
+    )
+
+    sid = "watchdog-deferred-session"
+    _REQUEST_TO_SESSION.clear()
+    _PENDING_ASK_REQUESTS.clear()
+    _REQUEST_TO_SESSION["req_pending"] = sid
+    try:
+        runner = ClaudeRunner(claude_cmd="claude")
+        state = ClaudeStreamState()
+        state.factory.started(ResumeToken(engine="claude", value=sid))
+        original_armed = time.monotonic() - 1000.0
+        state.result_received_at = original_armed
+
+        closed = anyio.Event()
+
+        class FakeStdin:
+            async def aclose(self) -> None:
+                closed.set()
+
+        real_sleep = anyio.sleep
+
+        async def fast_sleep(s: float) -> None:
+            await real_sleep(0)
+
+        monkeypatch.setattr("untether.runners.claude.anyio.sleep", fast_sleep)
+
+        class _StubLogger:
+            def info(self, *a, **k) -> None:
+                pass
+
+            def warning(self, *a, **k) -> None:
+                pass
+
+            def debug(self, *a, **k) -> None:
+                pass
+
+        reader_done = anyio.Event()
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(
+                runner._post_result_idle_watchdog,
+                state,
+                FakeStdin(),
+                reader_done,
+                _StubLogger(),
+                60.0,
+            )
+            # Let the watchdog tick a few times, then signal reader_done so
+            # the loop exits without our needing to wait.
+            for _ in range(5):
+                await real_sleep(0)
+            reader_done.set()
+            tg.cancel_scope.cancel()
+
+        assert not closed.is_set(), (
+            "watchdog must not close stdin while approval pending"
+        )
+        # The timer was re-armed (pushed forward), so result_received_at
+        # should now be more recent than the original arming.
+        assert state.result_received_at is not None
+        assert state.result_received_at > original_armed
+    finally:
+        _REQUEST_TO_SESSION.pop("req_pending", None)
+
+
+# ───── #507 — dead ScheduleWakeup outside /loop shortcut ───────────────
+
+
+@pytest.mark.anyio
+async def test_dead_schedule_wakeup_shortens_post_result_timeout(
+    monkeypatch,
+) -> None:
+    """When ScheduleWakeup armed during the run AND /loop is OFF for the
+    chat, ``_post_result_idle_watchdog`` cuts its effective timeout to
+    ``max_armed_delay + 60s`` so the session closes within delay+grace
+    instead of waiting the default 600s. Validates the fix for #507.
+    """
+    import anyio
+
+    from untether.runners.claude import (
+        _PENDING_ASK_REQUESTS,
+        _REQUEST_TO_SESSION,
+        ClaudeRunner,
+    )
+    from untether.runners.run_options import EngineRunOptions, apply_run_options
+    from untether.utils.paths import set_run_channel_id
+
+    _REQUEST_TO_SESSION.clear()
+    _PENDING_ASK_REQUESTS.clear()
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    state = ClaudeStreamState()
+    state.factory.started(
+        ResumeToken(engine="claude", value="watchdog-dead-wakeup-session"),
+    )
+    # ScheduleWakeup armed with delaySeconds=75 → scalar high-water-mark
+    # tracks 75.0. #544: the scalar replaced the per-tool_id
+    # ``live_wakeups_arm_delay`` dict so the value survives
+    # ``_clear_background_handle`` for the rest of the turn.
+    state.live_wakeups["toolu_W"] = time.monotonic() + 75.0
+    state.last_schedule_wakeup_arm_delay = 75.0
+    # Pretend the result event landed 200s ago — past the dead-wakeup
+    # effective_timeout (75 + 60 = 135s) but still well below the default
+    # 600s timeout.
+    state.result_received_at = time.monotonic() - 200.0
+
+    closed = anyio.Event()
+
+    class FakeStdin:
+        async def aclose(self) -> None:
+            closed.set()
+
+    fake_stdin = FakeStdin()
+    reader_done = anyio.Event()
+
+    real_sleep = anyio.sleep
+
+    async def fast_sleep(s: float) -> None:
+        await real_sleep(0)
+
+    monkeypatch.setattr("untether.runners.claude.anyio.sleep", fast_sleep)
+
+    captured_logs: list[dict] = []
+
+    class _StubLogger:
+        def info(self, event: str = "", **kwargs) -> None:
+            captured_logs.append({"event": event, **kwargs})
+
+        def warning(self, *a, **k) -> None:
+            pass
+
+        def debug(self, *a, **k) -> None:
+            pass
+
+    # /loop OFF for the chat (default). Set a chat_id so the shortcut
+    # finds it.
+    token = set_run_channel_id(12345)
+    try:
+        with apply_run_options(EngineRunOptions(loop_enabled=False)):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(
+                    runner._post_result_idle_watchdog,
+                    state,
+                    fake_stdin,
+                    reader_done,
+                    _StubLogger(),
+                    600.0,  # default timeout — shortcut should cut to 135s
+                )
+                with anyio.move_on_after(2.0):
+                    await closed.wait()
+                tg.cancel_scope.cancel()
+    finally:
+        from untether.utils.paths import reset_run_channel_id
+
+        reset_run_channel_id(token)
+
+    assert closed.is_set(), "watchdog should have closed stdin"
+    # Verify the closing log marked dead_wakeup=True with the shortened
+    # effective_timeout.
+    closing = next(
+        (
+            lg
+            for lg in captured_logs
+            if lg["event"] == "claude.post_result_idle.closing_stdin"
+        ),
+        None,
+    )
+    assert closing is not None
+    assert closing["dead_wakeup"] is True
+    assert closing["effective_timeout_s"] == 135.0
+
+
+@pytest.mark.anyio
+async def test_active_loop_preserves_default_post_result_timeout(
+    monkeypatch,
+) -> None:
+    """When /loop is ON for the chat, the dead-wakeup shortcut must NOT
+    apply — the wakeup is legitimate background work. The watchdog should
+    use the full default timeout.
+    """
+    import anyio
+
+    from untether.runners.claude import (
+        _PENDING_ASK_REQUESTS,
+        _REQUEST_TO_SESSION,
+        ClaudeRunner,
+    )
+    from untether.runners.run_options import EngineRunOptions, apply_run_options
+    from untether.utils.paths import set_run_channel_id
+
+    _REQUEST_TO_SESSION.clear()
+    _PENDING_ASK_REQUESTS.clear()
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    state = ClaudeStreamState()
+    state.factory.started(
+        ResumeToken(engine="claude", value="watchdog-loop-on-session"),
+    )
+    state.live_wakeups["toolu_W"] = time.monotonic() + 75.0
+    state.last_schedule_wakeup_arm_delay = 75.0
+    # Pretend result landed 200s ago — past the dead-wakeup shortcut
+    # threshold (135s), but well below the 600s default timeout. With
+    # /loop ON the watchdog should NOT close stdin yet.
+    state.result_received_at = time.monotonic() - 200.0
+
+    closed = anyio.Event()
+
+    class FakeStdin:
+        async def aclose(self) -> None:
+            closed.set()
+
+    fake_stdin = FakeStdin()
+    reader_done = anyio.Event()
+
+    real_sleep = anyio.sleep
+
+    async def fast_sleep(s: float) -> None:
+        await real_sleep(0)
+
+    monkeypatch.setattr("untether.runners.claude.anyio.sleep", fast_sleep)
+
+    class _StubLogger:
+        def info(self, *a, **k) -> None:
+            pass
+
+        def warning(self, *a, **k) -> None:
+            pass
+
+        def debug(self, *a, **k) -> None:
+            pass
+
+    token = set_run_channel_id(12345)
+    try:
+        with apply_run_options(EngineRunOptions(loop_enabled=True)):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(
+                    runner._post_result_idle_watchdog,
+                    state,
+                    fake_stdin,
+                    reader_done,
+                    _StubLogger(),
+                    600.0,
+                )
+                # Tick a few times, then signal reader_done.
+                for _ in range(10):
+                    await real_sleep(0)
+                reader_done.set()
+                tg.cancel_scope.cancel()
+    finally:
+        from untether.utils.paths import reset_run_channel_id
+
+        reset_run_channel_id(token)
+
+    assert not closed.is_set(), "with /loop ON, dead-wakeup shortcut must not fire"
+
+
+@pytest.mark.anyio
+async def test_dead_schedule_wakeup_shortens_post_result_after_tool_result_cleared(
+    monkeypatch,
+) -> None:
+    """#544: full lifecycle test for the #507 redux fix.
+
+    The original #507 unit tests directly seeded ``state.live_wakeups_arm_delay``
+    and bypassed ``_clear_background_handle``, which is why the rc11 fix
+    appeared green in CI but failed on channelo rc15 in production. This
+    test exercises the real translate path — tool_use → tool_result → result
+    — so the scalar high-water-mark MUST survive ``_clear_background_handle``
+    for the dead-wakeup shortcut to engage.
+    """
+    import anyio
+
+    from untether.runners.claude import (
+        _PENDING_ASK_REQUESTS,
+        _REQUEST_TO_SESSION,
+        ClaudeRunner,
+    )
+    from untether.runners.run_options import EngineRunOptions, apply_run_options
+    from untether.utils.paths import set_run_channel_id
+
+    _REQUEST_TO_SESSION.clear()
+    _PENDING_ASK_REQUESTS.clear()
+
+    state = ClaudeStreamState()
+    state.factory.started(ResumeToken(engine="claude", value="redux-session"))
+
+    # 1. tool_use ScheduleWakeup(delaySeconds=120) → register arm-delay
+    translate_claude_event(
+        _decode_event(
+            _make_tool_use_event("ScheduleWakeup", "toolu_W", {"delaySeconds": 120})
+        ),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    assert "toolu_W" in state.live_wakeups
+    assert state.last_schedule_wakeup_arm_delay == 120.0
+
+    # 2. tool_result → _clear_background_handle pops live_wakeups but the
+    # scalar high-water-mark MUST survive.
+    translate_claude_event(
+        _decode_event(_make_tool_result_event("toolu_W")),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    assert "toolu_W" not in state.live_wakeups, "tool_result must clear dict"
+    assert state.last_schedule_wakeup_arm_delay == 120.0, (
+        "scalar must survive _clear_background_handle (#544 regression check)"
+    )
+
+    # 3. Pretend the result event landed 200s ago — past the dead-wakeup
+    # effective_timeout (120 + 60 = 180s).
+    state.result_received_at = time.monotonic() - 200.0
+
+    # 4. Run the watchdog. With /loop OFF and scalar populated, it should
+    # close stdin and stamp ``dead_wakeup=True effective_timeout_s=180.0``.
+    closed = anyio.Event()
+
+    class FakeStdin:
+        async def aclose(self) -> None:
+            closed.set()
+
+    fake_stdin = FakeStdin()
+    reader_done = anyio.Event()
+
+    real_sleep = anyio.sleep
+
+    async def fast_sleep(s: float) -> None:
+        await real_sleep(0)
+
+    monkeypatch.setattr("untether.runners.claude.anyio.sleep", fast_sleep)
+
+    captured_logs: list[dict] = []
+
+    class _StubLogger:
+        def info(self, event: str = "", **kwargs) -> None:
+            captured_logs.append({"event": event, **kwargs})
+
+        def warning(self, *a, **k) -> None:
+            pass
+
+        def debug(self, *a, **k) -> None:
+            pass
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    token = set_run_channel_id(54321)
+    try:
+        with apply_run_options(EngineRunOptions(loop_enabled=False)):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(
+                    runner._post_result_idle_watchdog,
+                    state,
+                    fake_stdin,
+                    reader_done,
+                    _StubLogger(),
+                    600.0,
+                )
+                with anyio.move_on_after(2.0):
+                    await closed.wait()
+                tg.cancel_scope.cancel()
+    finally:
+        from untether.utils.paths import reset_run_channel_id
+
+        reset_run_channel_id(token)
+
+    assert closed.is_set(), "watchdog should have closed stdin"
+    closing = next(
+        (
+            lg
+            for lg in captured_logs
+            if lg["event"] == "claude.post_result_idle.closing_stdin"
+        ),
+        None,
+    )
+    assert closing is not None
+    assert closing["dead_wakeup"] is True
+    assert closing["effective_timeout_s"] == 180.0
+
+
+def test_multiple_schedule_wakeups_in_one_turn_use_max_delay() -> None:
+    """Two ScheduleWakeup calls in a single turn — the scalar must hold the
+    longest arm-delay so a 60s wakeup followed by a 240s wakeup still cuts
+    the watchdog timeout to 240 + 60 = 300s, not 60 + 60 = 120s.
+    """
+    state = ClaudeStreamState()
+
+    translate_claude_event(
+        _decode_event(
+            _make_tool_use_event("ScheduleWakeup", "toolu_W1", {"delaySeconds": 60})
+        ),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    assert state.last_schedule_wakeup_arm_delay == 60.0
+
+    translate_claude_event(
+        _decode_event(
+            _make_tool_use_event("ScheduleWakeup", "toolu_W2", {"delaySeconds": 240})
+        ),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    assert state.last_schedule_wakeup_arm_delay == 240.0, "max wins"
+
+    # A SHORTER arm after a longer one must NOT replace the high-water-mark.
+    translate_claude_event(
+        _decode_event(
+            _make_tool_use_event("ScheduleWakeup", "toolu_W3", {"delaySeconds": 120})
+        ),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    assert state.last_schedule_wakeup_arm_delay == 240.0, (
+        "shorter delays must not shrink the high-water-mark"
+    )
+
+
+def test_new_user_turn_resets_schedule_wakeup_arm_delay() -> None:
+    """A fresh user prompt (StreamUserMessage with non-tool_result content)
+    must reset the per-turn scalar so the next turn — if it does NOT call
+    ScheduleWakeup — falls back to the default 600s post-result timeout.
+    """
+    state = ClaudeStreamState()
+
+    # Turn 1: ScheduleWakeup armed
+    translate_claude_event(
+        _decode_event(
+            _make_tool_use_event("ScheduleWakeup", "toolu_W", {"delaySeconds": 90})
+        ),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    translate_claude_event(
+        _decode_event(_make_tool_result_event("toolu_W")),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    assert state.last_schedule_wakeup_arm_delay == 90.0
+
+    # Turn 2: a real user prompt arrives as a StreamUserMessage with a text
+    # block (NOT a tool_result block). The reset path must fire.
+    user_text_event = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Please continue with the next step."}
+            ],
+        },
+    }
+    translate_claude_event(
+        _decode_event(user_text_event),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    assert state.last_schedule_wakeup_arm_delay is None, (
+        "new user prompt must clear the per-turn arm-delay (#544)"
+    )
+
+
+def test_mixed_user_message_does_not_reset_arm_delay() -> None:
+    """A user message that contains BOTH tool_results AND non-tool_result
+    blocks (rare in practice but allowed by the protocol) must preserve
+    the scalar — the tool turn is still in flight at that point, so the
+    new-turn reset path is suppressed when any tool_result is present.
+    """
+    state = ClaudeStreamState()
+    translate_claude_event(
+        _decode_event(
+            _make_tool_use_event("ScheduleWakeup", "toolu_W", {"delaySeconds": 90})
+        ),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+
+    mixed_event = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_W",
+                    "content": "ok",
+                    "is_error": False,
+                },
+                {"type": "text", "text": "noise"},
+            ],
+        },
+    }
+    translate_claude_event(
+        _decode_event(mixed_event),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    assert state.last_schedule_wakeup_arm_delay == 90.0, (
+        "mixed user message must NOT clear the scalar (#544 edge case)"
+    )
+
+
+def test_bg_bash_register_sets_launched_at() -> None:
+    """#333: ``Bash(run_in_background=True)`` tool_use sets the
+    ``last_bg_bash_launched_at`` scalar (monotonic timestamp) in
+    addition to populating the ``live_bg_bashes`` set.
+    """
+    state = ClaudeStreamState()
+    assert state.last_bg_bash_launched_at is None
+
+    before = time.monotonic()
+    translate_claude_event(
+        _decode_event(
+            _make_tool_use_event(
+                "Bash", "toolu_B1", {"command": "sleep 30 &", "run_in_background": True}
+            )
+        ),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    after = time.monotonic()
+    assert "toolu_B1" in state.live_bg_bashes
+    assert state.last_bg_bash_launched_at is not None
+    assert before <= state.last_bg_bash_launched_at <= after
+
+
+def test_bg_bash_tool_result_preserves_launched_at() -> None:
+    """#333 regression check (mirrors #544): the scalar high-water-mark
+    must survive ``_clear_background_handle`` so the post-result idle
+    watchdog tick log can see that a bg-bash was launched even after
+    the tool_result pops the entry from ``live_bg_bashes``.
+    """
+    state = ClaudeStreamState()
+    translate_claude_event(
+        _decode_event(
+            _make_tool_use_event(
+                "Bash",
+                "toolu_B1",
+                {"command": "tail -f log &", "run_in_background": True},
+            )
+        ),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    launched_at = state.last_bg_bash_launched_at
+    assert launched_at is not None
+
+    translate_claude_event(
+        _decode_event(_make_tool_result_event("toolu_B1")),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    assert "toolu_B1" not in state.live_bg_bashes, "tool_result must clear set"
+    assert state.last_bg_bash_launched_at == launched_at, (
+        "scalar must survive _clear_background_handle (#333 regression check)"
+    )
+
+
+def test_multiple_bg_bashes_use_most_recent_launched_at() -> None:
+    """Two bg-bash launches in one turn — the scalar holds the MOST RECENT
+    launch timestamp. Unlike ScheduleWakeup arm-delay (where max-of-delays
+    wins), bg-bashes use last-write because the timestamp itself is
+    monotonically increasing.
+    """
+    state = ClaudeStreamState()
+
+    translate_claude_event(
+        _decode_event(
+            _make_tool_use_event(
+                "Bash", "toolu_B1", {"command": "x &", "run_in_background": True}
+            )
+        ),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    first = state.last_bg_bash_launched_at
+    assert first is not None
+
+    # Small artificial gap so monotonic ticks forward.
+    time.sleep(0.001)
+
+    translate_claude_event(
+        _decode_event(
+            _make_tool_use_event(
+                "Bash", "toolu_B2", {"command": "y &", "run_in_background": True}
+            )
+        ),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    second = state.last_bg_bash_launched_at
+    assert second is not None
+    assert second > first, "most-recent launch wins (monotonic last-write)"
+
+
+def test_new_user_turn_resets_bg_bash_launched_at() -> None:
+    """#333: a fresh user prompt (StreamUserMessage with non-tool_result
+    content) must reset the per-turn scalar. Mirrors the #544 reset
+    semantics for ``last_schedule_wakeup_arm_delay``.
+    """
+    state = ClaudeStreamState()
+
+    # Turn 1: bg-bash launched + tool_result confirmed
+    translate_claude_event(
+        _decode_event(
+            _make_tool_use_event(
+                "Bash", "toolu_B1", {"command": "z &", "run_in_background": True}
+            )
+        ),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    translate_claude_event(
+        _decode_event(_make_tool_result_event("toolu_B1")),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    assert state.last_bg_bash_launched_at is not None
+
+    # Turn 2: fresh user prompt (text-only StreamUserMessage)
+    user_text_event = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [{"type": "text", "text": "next step please"}],
+        },
+    }
+    translate_claude_event(
+        _decode_event(user_text_event),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    assert state.last_bg_bash_launched_at is None, (
+        "new user prompt must clear the per-turn launch tracker (#333)"
+    )
+
+
+def test_mixed_user_message_does_not_reset_bg_bash_launched_at() -> None:
+    """A user message that contains BOTH tool_results AND non-tool_result
+    blocks must preserve the scalar — the tool turn is still in flight
+    so the new-turn reset path is suppressed when any tool_result is
+    present. Mirrors the #544 mixed-batch edge case.
+    """
+    state = ClaudeStreamState()
+    translate_claude_event(
+        _decode_event(
+            _make_tool_use_event(
+                "Bash", "toolu_B1", {"command": "z &", "run_in_background": True}
+            )
+        ),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    launched_at = state.last_bg_bash_launched_at
+    assert launched_at is not None
+
+    mixed_event = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_B1",
+                    "content": "ok",
+                    "is_error": False,
+                },
+                {"type": "text", "text": "noise"},
+            ],
+        },
+    }
+    translate_claude_event(
+        _decode_event(mixed_event),
+        title="claude",
+        state=state,
+        factory=state.factory,
+    )
+    assert state.last_bg_bash_launched_at == launched_at, (
+        "mixed user message must NOT clear the scalar (#333 edge case)"
+    )
+
+
+@pytest.mark.anyio
+async def test_post_result_idle_watchdog_emits_lifecycle_logs(monkeypatch) -> None:
+    """#333: the watchdog MUST emit ``task_started`` at startup,
+    ``tick`` every iteration, and ``task_exited`` on every exit path.
+
+    This is the load-bearing diagnostic for the channelo silent-failure
+    scenario. The four candidate causes (result_received_at never set /
+    post_result_idle_enabled False / reader_done set early / task
+    crashed) cannot be discriminated without entry/exit/tick logs.
+    """
+    import anyio
+
+    from untether.runners.claude import (
+        _PENDING_ASK_REQUESTS,
+        _REQUEST_TO_SESSION,
+        ClaudeRunner,
+    )
+    from untether.runners.run_options import EngineRunOptions, apply_run_options
+    from untether.utils.paths import set_run_channel_id
+
+    _REQUEST_TO_SESSION.clear()
+    _PENDING_ASK_REQUESTS.clear()
+
+    state = ClaudeStreamState()
+    state.factory.started(ResumeToken(engine="claude", value="instrumentation-session"))
+    # Arm the watchdog by pretending result landed 700s ago (past the
+    # 600s default timeout so a tick should observe ``would_close=True``
+    # and the loop should close stdin).
+    state.result_received_at = time.monotonic() - 700.0
+
+    closed = anyio.Event()
+
+    class FakeStdin:
+        async def aclose(self) -> None:
+            closed.set()
+
+    fake_stdin = FakeStdin()
+    reader_done = anyio.Event()
+
+    real_sleep = anyio.sleep
+
+    async def fast_sleep(s: float) -> None:
+        await real_sleep(0)
+
+    monkeypatch.setattr("untether.runners.claude.anyio.sleep", fast_sleep)
+
+    captured_logs: list[dict] = []
+
+    class _StubLogger:
+        def info(self, event: str = "", **kwargs) -> None:
+            captured_logs.append({"event": event, "level": "info", **kwargs})
+
+        def warning(self, event: str = "", **kwargs) -> None:
+            captured_logs.append({"event": event, "level": "warning", **kwargs})
+
+        def debug(self, *a, **k) -> None:
+            pass
+
+        def error(self, *a, **k) -> None:
+            pass
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    token = set_run_channel_id(54321)
+    try:
+        with apply_run_options(EngineRunOptions(loop_enabled=False)):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(
+                    runner._post_result_idle_watchdog,
+                    state,
+                    fake_stdin,
+                    reader_done,
+                    _StubLogger(),
+                    600.0,
+                )
+                with anyio.move_on_after(2.0):
+                    await closed.wait()
+                tg.cancel_scope.cancel()
+    finally:
+        from untether.utils.paths import reset_run_channel_id
+
+        reset_run_channel_id(token)
+
+    events = [lg["event"] for lg in captured_logs]
+    assert "claude.post_result_idle.task_started" in events, (
+        "task_started must fire at entry (#333)"
+    )
+    assert any(e == "claude.post_result_idle.tick" for e in events), (
+        "tick must fire at least once (#333)"
+    )
+    assert "claude.post_result_idle.closing_stdin" in events
+    assert "claude.post_result_idle.task_exited" in events, (
+        "task_exited must fire on every exit path (#333)"
+    )
+
+    # Verify ordering: task_started before any tick, task_exited last.
+    assert events.index("claude.post_result_idle.task_started") < events.index(
+        "claude.post_result_idle.tick"
+    )
+    assert events[-1] == "claude.post_result_idle.task_exited"
+
+    # The closing exit path tags reason="stdin_closed".
+    exit_log = next(
+        lg
+        for lg in captured_logs
+        if lg["event"] == "claude.post_result_idle.task_exited"
+    )
+    assert exit_log["reason"] == "stdin_closed"
+
+    # The first armed tick should show ``would_close=True`` since elapsed
+    # (700s) > effective_timeout (600s) and no pending requests.
+    armed_ticks = [
+        lg
+        for lg in captured_logs
+        if lg["event"] == "claude.post_result_idle.tick" and lg["armed"] is True
+    ]
+    assert armed_ticks, "at least one armed tick expected"
+    assert armed_ticks[0]["would_close"] is True
+
+
+@pytest.mark.anyio
+async def test_post_result_idle_watchdog_exits_reader_done_on_reader_done(
+    monkeypatch,
+) -> None:
+    """#333: when ``reader_done`` is set before the timeout expires, the
+    watchdog must exit with ``reason=reader_done`` — not ``stdin_closed``
+    or ``cancelled``. This is the normal-flow exit path (subprocess
+    finished naturally, no need for the safety-net to close stdin).
+    """
+    import anyio
+
+    from untether.runners.claude import (
+        _PENDING_ASK_REQUESTS,
+        _REQUEST_TO_SESSION,
+        ClaudeRunner,
+    )
+
+    _REQUEST_TO_SESSION.clear()
+    _PENDING_ASK_REQUESTS.clear()
+
+    state = ClaudeStreamState()
+    state.factory.started(ResumeToken(engine="claude", value="reader-done-session"))
+    # Don't set result_received_at — keeps the watchdog in the
+    # ``armed=False`` continue path, so it can't possibly close stdin
+    # on its own and any exit MUST be reader_done.
+
+    class FakeStdin:
+        async def aclose(self) -> None:
+            pass
+
+    reader_done = anyio.Event()
+
+    real_sleep = anyio.sleep
+
+    async def fast_sleep(s: float) -> None:
+        await real_sleep(0)
+
+    monkeypatch.setattr("untether.runners.claude.anyio.sleep", fast_sleep)
+
+    captured_logs: list[dict] = []
+
+    class _StubLogger:
+        def info(self, event: str = "", **kwargs) -> None:
+            captured_logs.append({"event": event, **kwargs})
+
+        def warning(self, *a, **k) -> None:
+            pass
+
+        def debug(self, *a, **k) -> None:
+            pass
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(
+            runner._post_result_idle_watchdog,
+            state,
+            FakeStdin(),
+            reader_done,
+            _StubLogger(),
+            600.0,
+        )
+        # Let the watchdog tick at least once in the unarmed branch.
+        await real_sleep(0.05)
+        reader_done.set()
+
+    exit_log = next(
+        (
+            lg
+            for lg in captured_logs
+            if lg["event"] == "claude.post_result_idle.task_exited"
+        ),
+        None,
+    )
+    assert exit_log is not None
+    assert exit_log["reason"] == "reader_done"
+
+
+def test_meta_line_renders_turn_complete_marker() -> None:
+    """format_meta_line includes the `complete` hint when set on meta."""
+    from untether.markdown import format_meta_line
+
+    line = format_meta_line({"model": "sonnet", "complete": "✓ turn complete"})
+    assert line is not None
+    assert "✓ turn complete" in line
+
+
+def test_meta_line_omits_complete_when_absent() -> None:
+    """Absence of the `complete` key keeps the legacy footer shape."""
+    from untether.markdown import format_meta_line
+
+    line = format_meta_line({"model": "sonnet"})
+    assert line is not None
+    assert "✓ turn complete" not in line
+
+
+def test_is_session_alive_reads_session_stdin_registry() -> None:
+    """is_session_alive (#289) returns True iff session_id is in _SESSION_STDIN."""
+    from untether.runners.claude import _SESSION_STDIN, is_session_alive
+
+    sid = "test-session-289-alive"
+    try:
+        assert is_session_alive(sid) is False
+        _SESSION_STDIN[sid] = object()  # any sentinel is enough — we test membership
+        assert is_session_alive(sid) is True
+    finally:
+        _SESSION_STDIN.pop(sid, None)
+
+
+def test_is_session_alive_unknown_session_returns_false() -> None:
+    """Sessions never registered are not alive."""
+    from untether.runners.claude import is_session_alive
+
+    assert is_session_alive("session-that-was-never-spawned") is False
+
+
+# ───── #289 — /loop and ScheduleWakeup observation ─────────────────────
+
+
+def _seed_state_for_loop_observation(
+    state: ClaudeStreamState, *, session_id: str = "sess-289"
+) -> None:
+    """Helper: set state.factory._resume so ``_observe_loop_tool_use`` can
+    read the session_id without a full system.init flow."""
+    state.factory._resume = ResumeToken(engine="claude", value=session_id)
+    state.first_user_message_text = "user typed /loop check the deploy"
+
+
+@pytest.mark.anyio
+class TestLoopObservation:
+    """Cover the new ``_observe_loop_tool_use`` /
+    ``_observe_loop_tool_result`` helpers and the ``_loop_enabled_for_chat``
+    gate.  Mirrors ``test_loop_scheduler.py`` cleanup conventions.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _cleanup(self):
+        from untether import loop_scheduler
+
+        loop_scheduler.uninstall()
+        yield
+        loop_scheduler.uninstall()
+
+    @pytest.fixture
+    def _enable_loop(self):
+        """Toggle Loop mode ON via the per-chat run-options contextvar so
+        the master gate inside the observer doesn't short-circuit."""
+        from untether.runners.run_options import (
+            EngineRunOptions,
+            apply_run_options,
+        )
+
+        with apply_run_options(EngineRunOptions(loop_enabled=True)):
+            yield
+
+    @pytest.fixture
+    def _disable_loop(self):
+        """Toggle Loop mode OFF explicitly."""
+        from untether.runners.run_options import (
+            EngineRunOptions,
+            apply_run_options,
+        )
+
+        with apply_run_options(EngineRunOptions(loop_enabled=False)):
+            yield
+
+    @pytest.fixture
+    def _set_chat(self):
+        """Push a chat_id into the run-context contextvar."""
+        from untether.utils.paths import (
+            reset_run_channel_id,
+            set_run_channel_id,
+        )
+
+        token = set_run_channel_id(7777)
+        try:
+            yield 7777
+        finally:
+            reset_run_channel_id(token)
+
+    @pytest.fixture
+    async def _installed_scheduler(self):
+        """Install loop_scheduler so observers can call register_*."""
+        from untether import loop_scheduler
+
+        async def _noop(*args, **kwargs):
+            return None
+
+        class _Transport:
+            async def send(self, **_):
+                return None
+
+            async def edit(self, **_):
+                return None
+
+            async def delete(self, _ref):
+                return None
+
+        async with anyio.create_task_group() as tg:
+            loop_scheduler.install(tg, _noop, _Transport(), 1)
+            try:
+                yield
+            finally:
+                tg.cancel_scope.cancel()
+
+    @pytest.mark.usefixtures("_enable_loop", "_installed_scheduler")
+    async def test_observer_skipped_when_chat_id_unset(self):
+        """Without ``set_run_channel_id`` the observer must no-op."""
+        from untether import loop_scheduler
+
+        state = ClaudeStreamState()
+        _seed_state_for_loop_observation(state)
+        translate_claude_event(
+            _decode_event(
+                _make_tool_use_event(
+                    "CronCreate",
+                    "toolu_C1",
+                    {"cron": "* * * * *", "prompt": "x", "recurring": True},
+                )
+            ),
+            title="claude",
+            state=state,
+            factory=state.factory,
+        )
+        assert loop_scheduler.active_count() == 0
+
+    @pytest.mark.usefixtures("_disable_loop", "_set_chat", "_installed_scheduler")
+    async def test_observer_skipped_when_toggle_off(self):
+        """Loop mode OFF → no registration."""
+        from untether import loop_scheduler
+
+        state = ClaudeStreamState()
+        _seed_state_for_loop_observation(state)
+        translate_claude_event(
+            _decode_event(
+                _make_tool_use_event(
+                    "CronCreate",
+                    "toolu_C2",
+                    {"cron": "* * * * *", "prompt": "ping", "recurring": True},
+                )
+            ),
+            title="claude",
+            state=state,
+            factory=state.factory,
+        )
+        assert loop_scheduler.active_count() == 0
+
+    @pytest.mark.usefixtures("_enable_loop", "_set_chat", "_installed_scheduler")
+    async def test_cron_create_registers_when_enabled(self):
+        """CronCreate with toggle ON registers a recurring entry."""
+        from untether import loop_scheduler
+
+        state = ClaudeStreamState()
+        _seed_state_for_loop_observation(state, session_id="sess-cron-on")
+        translate_claude_event(
+            _decode_event(
+                _make_tool_use_event(
+                    "CronCreate",
+                    "toolu_C3",
+                    {
+                        "cron": "*/5 * * * *",
+                        "prompt": "check the deploy",
+                        "recurring": True,
+                    },
+                )
+            ),
+            title="claude",
+            state=state,
+            factory=state.factory,
+        )
+        assert loop_scheduler.active_count() == 1
+        pending = loop_scheduler.pending_for_chat(7777)
+        assert len(pending) == 1
+        assert pending[0].cron_expression == "*/5 * * * *"
+        assert pending[0].prompt == "check the deploy"
+        assert pending[0].recurring is True
+        assert pending[0].resume_token == "sess-cron-on"
+
+    @pytest.mark.usefixtures("_enable_loop", "_set_chat", "_installed_scheduler")
+    async def test_cron_create_uses_cron_field_not_cron_expression(self):
+        """Probe 5: input field is ``cron`` — fallback aliases shouldn't
+        override the canonical name."""
+        from untether import loop_scheduler
+
+        state = ClaudeStreamState()
+        _seed_state_for_loop_observation(state)
+        translate_claude_event(
+            _decode_event(
+                _make_tool_use_event(
+                    "CronCreate",
+                    "toolu_C4",
+                    {
+                        "cron": "0 * * * *",
+                        "cron_expression": "* * * * *",  # legacy alias — should be ignored
+                        "prompt": "y",
+                        "recurring": True,
+                    },
+                )
+            ),
+            title="claude",
+            state=state,
+            factory=state.factory,
+        )
+        pending = loop_scheduler.pending_for_chat(7777)
+        assert len(pending) == 1
+        assert pending[0].cron_expression == "0 * * * *"
+
+    @pytest.mark.usefixtures("_enable_loop", "_set_chat", "_installed_scheduler")
+    async def test_cron_create_skipped_when_prompt_missing(self):
+        """Defensive: missing prompt field → no registration."""
+        from untether import loop_scheduler
+
+        state = ClaudeStreamState()
+        _seed_state_for_loop_observation(state)
+        translate_claude_event(
+            _decode_event(
+                _make_tool_use_event(
+                    "CronCreate",
+                    "toolu_C5",
+                    {"cron": "* * * * *", "recurring": True},
+                )
+            ),
+            title="claude",
+            state=state,
+            factory=state.factory,
+        )
+        assert loop_scheduler.active_count() == 0
+
+    @pytest.mark.usefixtures("_enable_loop", "_set_chat", "_installed_scheduler")
+    async def test_schedule_wakeup_registers_when_above_threshold(self):
+        """Long ScheduleWakeup → register Untether-side timer."""
+        from untether import loop_scheduler
+
+        state = ClaudeStreamState()
+        _seed_state_for_loop_observation(state)
+        # 3600s > default inline_threshold_seconds=300 — should register.
+        translate_claude_event(
+            _decode_event(
+                _make_tool_use_event(
+                    "ScheduleWakeup",
+                    "toolu_W1",
+                    {
+                        "delaySeconds": 3600,
+                        "reason": "long-poll",
+                        "prompt": "check progress",
+                    },
+                )
+            ),
+            title="claude",
+            state=state,
+            factory=state.factory,
+        )
+        pending = loop_scheduler.pending_for_chat(7777)
+        assert len(pending) == 1
+        assert pending[0].kind == "wakeup"
+        assert pending[0].delay_seconds == 3600.0
+
+    @pytest.mark.usefixtures("_enable_loop", "_set_chat", "_installed_scheduler")
+    async def test_schedule_wakeup_skipped_when_below_threshold(self):
+        """Short waits stay rendered live by the rc8 countdown — no
+        Untether-side timer."""
+        from untether import loop_scheduler
+
+        state = ClaudeStreamState()
+        _seed_state_for_loop_observation(state)
+        translate_claude_event(
+            _decode_event(
+                _make_tool_use_event(
+                    "ScheduleWakeup",
+                    "toolu_W2",
+                    {"delaySeconds": 60, "prompt": "x"},
+                )
+            ),
+            title="claude",
+            state=state,
+            factory=state.factory,
+        )
+        assert loop_scheduler.active_count() == 0
+        # rc8 countdown (live_wakeups) still populated by
+        # _register_background_handle, regardless of loop observation.
+        assert "toolu_W2" in state.live_wakeups
+
+    @pytest.mark.usefixtures("_enable_loop", "_set_chat", "_installed_scheduler")
+    async def test_cron_delete_cancels_matching_entry(self):
+        """CronDelete with the upstream ID cancels the matching entry."""
+        from untether import loop_scheduler
+
+        state = ClaudeStreamState()
+        _seed_state_for_loop_observation(state)
+        # Register an entry, then bind upstream ID, then delete.
+        translate_claude_event(
+            _decode_event(
+                _make_tool_use_event(
+                    "CronCreate",
+                    "toolu_CD1",
+                    {"cron": "* * * * *", "prompt": "x", "recurring": True},
+                )
+            ),
+            title="claude",
+            state=state,
+            factory=state.factory,
+        )
+        # tool_result with upstream ID
+        result = _make_tool_result_event("toolu_CD1")
+        result["message"]["content"][0]["content"] = (
+            "Scheduled recurring job abcdef12 (Every minute). Session-only ..."
+        )
+        translate_claude_event(
+            _decode_event(result),
+            title="claude",
+            state=state,
+            factory=state.factory,
+        )
+        # Now CronDelete that ID
+        translate_claude_event(
+            _decode_event(
+                _make_tool_use_event("CronDelete", "toolu_CD2", {"id": "abcdef12"})
+            ),
+            title="claude",
+            state=state,
+            factory=state.factory,
+        )
+        assert loop_scheduler.active_count() == 0
+
+    @pytest.mark.usefixtures("_enable_loop", "_set_chat", "_installed_scheduler")
+    async def test_tool_result_binds_upstream_cron_id(self):
+        """``_observe_loop_tool_result`` parses the result text and binds
+        the 8-char upstream ID via :func:`bind_upstream_id`."""
+        from untether import loop_scheduler
+
+        state = ClaudeStreamState()
+        _seed_state_for_loop_observation(state)
+        translate_claude_event(
+            _decode_event(
+                _make_tool_use_event(
+                    "CronCreate",
+                    "toolu_BU1",
+                    {"cron": "* * * * *", "prompt": "x", "recurring": True},
+                )
+            ),
+            title="claude",
+            state=state,
+            factory=state.factory,
+        )
+        result = _make_tool_result_event("toolu_BU1")
+        result["message"]["content"][0]["content"] = (
+            "Scheduled recurring job 12345678 (Every minute). Session-only ..."
+        )
+        translate_claude_event(
+            _decode_event(result),
+            title="claude",
+            state=state,
+            factory=state.factory,
+        )
+        # The entry now has upstream_cron_id bound — cancel_by_upstream_id
+        # must succeed.
+        assert loop_scheduler.cancel_by_upstream_id("12345678") is True
+
+    @pytest.mark.usefixtures("_set_chat")
+    async def test_loop_enabled_for_chat_run_options_overrides_global(self):
+        """Per-chat run option True overrides global config False (the
+        common case — user enables Loop mode in their chat)."""
+        from untether.runners.claude import _loop_enabled_for_chat
+        from untether.runners.run_options import (
+            EngineRunOptions,
+            apply_run_options,
+        )
+
+        with apply_run_options(EngineRunOptions(loop_enabled=True)):
+            assert _loop_enabled_for_chat(7777) is True
+        with apply_run_options(EngineRunOptions(loop_enabled=False)):
+            assert _loop_enabled_for_chat(7777) is False
+        # No run options at all → fall back to global ([loop] enabled,
+        # default False).  Use a real options=None context to verify.
+        from untether.runners.run_options import (
+            reset_run_options,
+            set_run_options,
+        )
+
+        token = set_run_options(None)
+        try:
+            assert _loop_enabled_for_chat(7777) is False
+        finally:
+            reset_run_options(token)
+
+
+def test_first_user_message_text_captured_in_new_state() -> None:
+    """new_state should snapshot the prompt for sentinel-fallback later."""
+    runner = ClaudeRunner(
+        claude_cmd="claude",
+        model=None,
+        permission_mode=None,
+        allowed_tools=[],
+        extra_args=[],
+        dangerously_skip_permissions=False,
+        use_api_billing=None,
+        session_title=None,
+    )
+    state = runner.new_state("user typed /loop X", None)
+    assert state.first_user_message_text == "user typed /loop X"
+
+
+# ===========================================================================
+# #333 — post-result hang fix (Tier 1 watchdog subcountdown + Tier 3 limbo)
+# ===========================================================================
+
+
+class _FakeProc:
+    """Minimal anyio.Process stand-in for subcountdown tests.
+
+    Setting ``returncode`` to a non-None value simulates subprocess exit.
+    """
+
+    def __init__(self, pid: int = 99999, returncode: int | None = None):
+        self.pid = pid
+        self.returncode: int | None = returncode
+
+
+class _RecordingLogger:
+    """Capture structlog-style log events for assertions."""
+
+    def __init__(self) -> None:
+        self.records: list[tuple[str, str, dict]] = []  # (level, event, kwargs)
+
+    def _record(self, level: str, *args: object, **kwargs: object) -> None:
+        event = str(args[0]) if args else kwargs.get("event", "")
+        self.records.append((level, str(event), dict(kwargs)))
+
+    def info(self, *a: object, **k: object) -> None:
+        self._record("info", *a, **k)
+
+    def warning(self, *a: object, **k: object) -> None:
+        self._record("warning", *a, **k)
+
+    def debug(self, *a: object, **k: object) -> None:
+        self._record("debug", *a, **k)
+
+    def error(self, *a: object, **k: object) -> None:
+        self._record("error", *a, **k)
+
+    def events(self, level: str | None = None) -> list[str]:
+        return [e for lvl, e, _ in self.records if level is None or lvl == level]
+
+
+@pytest.mark.anyio
+async def test_333_reader_done_but_alive_triggers_subcountdown(monkeypatch) -> None:
+    """#333 Tier 1: when reader_done fires while subprocess is still alive,
+    the watchdog must enter the subcountdown instead of returning early."""
+    import anyio
+
+    from untether.runner import JsonlStreamState
+    from untether.runners.claude import (
+        _PENDING_ASK_REQUESTS,
+        _REQUEST_TO_SESSION,
+        ClaudeRunner,
+    )
+
+    _REQUEST_TO_SESSION.clear()
+    _PENDING_ASK_REQUESTS.clear()
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    # Speed up the subcountdown poll loop and SIGTERM grace for tests.
+    runner._subcountdown_poll_interval_s = 0.02
+    runner._subcountdown_limbo_detect_threshold_s = 0.05
+    runner._subcountdown_sigterm_grace_s = 0.1
+    runner._subcountdown_sigterm_grace_poll_s = 0.02
+
+    state = ClaudeStreamState()
+    state.factory.started(
+        ResumeToken(engine="claude", value="sub-sess-1"),
+    )
+    state.result_received_at = time.monotonic() - 0.5
+    stream = JsonlStreamState(expected_session=None)
+
+    proc = _FakeProc(pid=42424, returncode=None)
+    killed_signals: list[int] = []
+
+    def _fake_killpg(pgid: int, sig: int) -> None:
+        killed_signals.append(sig)
+        # Simulate SIGTERM not stopping the process (so SIGKILL follows).
+        if sig == signal.SIGKILL:
+            proc.returncode = -9
+
+    monkeypatch.setattr("os.killpg", _fake_killpg)
+
+    logger = _RecordingLogger()
+    reader_done = anyio.Event()
+
+    # Pre-fire reader_done so the entry check sees it and hands off to the
+    # subcountdown immediately.
+    reader_done.set()
+
+    class FakeStdin:
+        async def aclose(self) -> None:
+            pass
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(
+            runner._post_result_idle_watchdog,
+            state,
+            FakeStdin(),
+            reader_done,
+            logger,
+            0.1,  # 100 ms timeout — short enough for real-time test
+            proc,
+            stream,
+        )
+        # Wait for the subcountdown to fire SIGTERM (or until timeout).
+        with anyio.move_on_after(3.0):
+            while signal.SIGKILL not in killed_signals:
+                await anyio.sleep(0.02)
+        tg.cancel_scope.cancel()
+
+    events = logger.events()
+    assert "claude.post_result_idle.reader_done_but_alive" in events
+    assert signal.SIGTERM in killed_signals
+    assert signal.SIGKILL in killed_signals  # SIGTERM didn't stop our fake proc
+    exit_reasons = [
+        kw.get("reason")
+        for lvl, e, kw in logger.records
+        if e == "claude.post_result_idle.task_exited"
+    ]
+    assert "reader_done_but_alive_timeout" in exit_reasons
+
+
+@pytest.mark.anyio
+async def test_333_subprocess_exits_during_subcountdown(monkeypatch) -> None:
+    """#333 Tier 1: if the subprocess exits naturally during the subcountdown,
+    the watchdog records `subprocess_exited_during_subcountdown` and does NOT
+    SIGTERM."""
+    import anyio
+
+    from untether.runner import JsonlStreamState
+    from untether.runners.claude import (
+        _PENDING_ASK_REQUESTS,
+        _REQUEST_TO_SESSION,
+        ClaudeRunner,
+    )
+
+    _REQUEST_TO_SESSION.clear()
+    _PENDING_ASK_REQUESTS.clear()
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    runner._subcountdown_poll_interval_s = 0.02
+
+    state = ClaudeStreamState()
+    state.factory.started(ResumeToken(engine="claude", value="sub-sess-2"))
+    state.result_received_at = time.monotonic() - 0.5
+    stream = JsonlStreamState(expected_session=None)
+
+    proc = _FakeProc(pid=42425, returncode=None)
+    killed_signals: list[int] = []
+
+    monkeypatch.setattr("os.killpg", lambda pgid, sig: killed_signals.append(sig))
+
+    logger = _RecordingLogger()
+    reader_done = anyio.Event()
+    reader_done.set()
+
+    class FakeStdin:
+        async def aclose(self) -> None:
+            pass
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(
+            runner._post_result_idle_watchdog,
+            state,
+            FakeStdin(),
+            reader_done,
+            logger,
+            5.0,  # plenty of time — subprocess should exit first
+            proc,
+            stream,
+        )
+        # Wait for the subcountdown to begin, then simulate subprocess exit.
+        await anyio.sleep(0.1)
+        proc.returncode = 0
+        # Wait for the watchdog to notice and record the exit reason.
+        with anyio.move_on_after(2.0):
+            while not any(
+                e == "claude.post_result_idle.task_exited" for _, e, _ in logger.records
+            ):
+                await anyio.sleep(0.02)
+        tg.cancel_scope.cancel()
+
+    assert killed_signals == []
+    exit_reasons = [
+        kw.get("reason")
+        for lvl, e, kw in logger.records
+        if e == "claude.post_result_idle.task_exited"
+    ]
+    assert "subprocess_exited_during_subcountdown" in exit_reasons
+
+
+@pytest.mark.anyio
+async def test_333_subcountdown_defers_on_pending_request(monkeypatch) -> None:
+    """#333 Tier 1: if pending control_request appears, subcountdown re-arms
+    instead of SIGTERMing (mirrors _post_result_idle_watchdog's deferred
+    re-arm)."""
+    import anyio
+
+    from untether.runner import JsonlStreamState
+    from untether.runners.claude import (
+        _PENDING_ASK_REQUESTS,
+        _REQUEST_TO_SESSION,
+        ClaudeRunner,
+    )
+
+    sid = "sub-sess-3"
+    _REQUEST_TO_SESSION.clear()
+    _PENDING_ASK_REQUESTS.clear()
+    _REQUEST_TO_SESSION["req_x"] = sid
+    try:
+        runner = ClaudeRunner(claude_cmd="claude")
+        runner._subcountdown_poll_interval_s = 0.02
+
+        state = ClaudeStreamState()
+        state.factory.started(ResumeToken(engine="claude", value=sid))
+        state.result_received_at = time.monotonic() - 0.5
+        stream = JsonlStreamState(expected_session=None)
+
+        proc = _FakeProc(pid=42426, returncode=None)
+        killed_signals: list[int] = []
+
+        monkeypatch.setattr("os.killpg", lambda pgid, sig: killed_signals.append(sig))
+
+        logger = _RecordingLogger()
+        reader_done = anyio.Event()
+        reader_done.set()
+
+        class FakeStdin:
+            async def aclose(self) -> None:
+                pass
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(
+                runner._post_result_idle_watchdog,
+                state,
+                FakeStdin(),
+                reader_done,
+                logger,
+                0.05,  # tiny timeout — would normally trigger SIGTERM fast
+                proc,
+                stream,
+            )
+            # Let several poll cycles run. Each tick should see the pending
+            # request and defer rather than fire SIGTERM.
+            await anyio.sleep(0.4)
+            tg.cancel_scope.cancel()
+
+        assert killed_signals == [], (
+            "watchdog must defer SIGTERM while a control_request is pending"
+        )
+        deferred = [
+            e
+            for lvl, e, kw in logger.records
+            if e == "claude.post_result_idle.subcountdown_deferred"
+        ]
+        assert deferred, "expected subcountdown_deferred log to fire"
+    finally:
+        _REQUEST_TO_SESSION.clear()
+        _PENDING_ASK_REQUESTS.clear()
+
+
+@pytest.mark.anyio
+async def test_333_lifecycle_state_transitions_logged(monkeypatch) -> None:
+    """Task 4a: subprocess.state.* transitions emitted in the expected order
+    when the subcountdown fires."""
+    import anyio
+
+    from untether.runner import JsonlStreamState
+    from untether.runners.claude import (
+        _PENDING_ASK_REQUESTS,
+        _REQUEST_TO_SESSION,
+        ClaudeRunner,
+    )
+
+    _REQUEST_TO_SESSION.clear()
+    _PENDING_ASK_REQUESTS.clear()
+
+    runner = ClaudeRunner(claude_cmd="claude")
+    runner._subcountdown_poll_interval_s = 0.02
+    runner._subcountdown_sigterm_grace_s = 0.1
+    runner._subcountdown_sigterm_grace_poll_s = 0.02
+
+    state = ClaudeStreamState()
+    state.factory.started(ResumeToken(engine="claude", value="state-sess"))
+    state.result_received_at = time.monotonic() - 0.5
+    stream = JsonlStreamState(expected_session=None)
+    assert stream.lifecycle_state == "spawned"
+
+    proc = _FakeProc(pid=42427, returncode=None)
+
+    def _fake_killpg(pgid: int, sig: int) -> None:
+        if sig == signal.SIGTERM:
+            proc.returncode = -15  # exit on SIGTERM
+
+    monkeypatch.setattr("os.killpg", _fake_killpg)
+
+    logger = _RecordingLogger()
+    reader_done = anyio.Event()
+    reader_done.set()
+
+    class FakeStdin:
+        async def aclose(self) -> None:
+            pass
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(
+            runner._post_result_idle_watchdog,
+            state,
+            FakeStdin(),
+            reader_done,
+            logger,
+            0.1,
+            proc,
+            stream,
+        )
+        with anyio.move_on_after(3.0):
+            while stream.lifecycle_state != "exited":
+                await anyio.sleep(0.02)
+        tg.cancel_scope.cancel()
+
+    state_events = [e for e in logger.events() if e.startswith("subprocess.state.")]
+    assert "subprocess.state.reader_eof" in state_events
+    assert "subprocess.state.subcountdown" in state_events
+    assert "subprocess.state.sigterm_sent" in state_events
+    assert "subprocess.state.exited" in state_events
+    # Final lifecycle_state reflects the last transition.
+    assert stream.lifecycle_state == "exited"

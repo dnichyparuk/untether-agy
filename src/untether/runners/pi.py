@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 from collections.abc import AsyncIterator
@@ -46,6 +47,28 @@ ENGINE: EngineId = "pi"
 _RESUME_RE = re.compile(r"(?im)^\s*`?pi\s+--session\s+(?P<token>.+?)`?\s*$")
 
 _SESSION_ID_PREFIX_LEN = 8
+
+
+def _load_env_extras() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """#409: read [security] env_extra_allow / env_extra_prefix_allow.
+
+    Best-effort — config errors must never block a run, so we swallow
+    them and fall back to the built-in defaults. Returns
+    ``(extra_exact, extra_prefix)``.
+    """
+    from ..settings import load_settings_if_exists
+
+    try:
+        result = load_settings_if_exists()
+        if result is None:
+            return ((), ())
+        settings, _ = result
+        return (
+            tuple(settings.security.env_extra_allow),
+            tuple(settings.security.env_extra_prefix_allow),
+        )
+    except Exception:  # noqa: BLE001 — never let config errors block a run
+        return ((), ())
 
 
 @dataclass(slots=True)
@@ -455,10 +478,13 @@ class PiRunner(ResumeTokenMixin, JsonlSubprocessRunner):
     def env(self, *, state: PiStreamState) -> dict[str, str] | None:
         # #198: allowlist filter — Pi subprocess no longer inherits the
         # parent's full environment. See `utils/env_policy.py` for the
-        # canonical list + extension notes.
-        from ..utils.env_policy import filtered_env
+        # canonical list + extension notes. #409: thread per-deployment
+        # extras from [security] env_extra_allow / env_extra_prefix_allow.
+        from ..utils.env_policy import filtered_env, log_user_extensions_once
 
-        env = filtered_env()
+        extra_exact, extra_prefix = _load_env_extras()
+        log_user_extensions_once(extra_exact, extra_prefix)
+        env = filtered_env(extra_allow=extra_exact, extra_prefix=extra_prefix)
         env.setdefault("NO_COLOR", "1")
         env.setdefault("CI", "1")
         return env
@@ -586,7 +612,12 @@ class PiRunner(ResumeTokenMixin, JsonlSubprocessRunner):
     def _new_session_path(self) -> str:
         cwd = get_run_base_dir() or Path.cwd()
         session_dir = _default_session_dir(cwd)
-        session_dir.mkdir(parents=True, exist_ok=True)
+        # #207: 0o700 keeps Pi session JSONL out of reach of other users on
+        # shared hosts. mkdir's mode arg is ignored for existing dirs, so
+        # chmod the directory after to also tighten any pre-existing one.
+        session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with contextlib.suppress(OSError):
+            session_dir.chmod(0o700)
         timestamp = datetime.now(UTC).isoformat()
         safe_timestamp = timestamp.replace(":", "-").replace(".", "-")
         token = uuid4().hex

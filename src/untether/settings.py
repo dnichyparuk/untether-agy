@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Annotated, Any, ClassVar, Literal
@@ -74,6 +75,11 @@ class TelegramFilesSettings(BaseModel):
     outbox_dir: NonEmptyStr = ".untether-outbox"
     outbox_max_files: int = Field(default=10, ge=1, le=50)
     outbox_cleanup: bool = True
+    # #524: surface "skipped" outbox entries (directories, oversized files,
+    # deny-globbed files, …) to the user in chat. Previously these were
+    # logged as ``outbox.skipped`` only — the agent's "I've prepared the
+    # guides folder for you" final message became a silent lie.
+    outbox_notify_skipped: bool = True
 
     @field_validator("uploads_dir")
     @classmethod
@@ -116,12 +122,21 @@ class TelegramTransportSettings(BaseModel):
     bot_token: SecretStr
     chat_id: StrictInt
     allowed_user_ids: list[StrictInt] = Field(default_factory=list)
+    # #377: opt-in escape hatch for demos/dev. When the allowlist is
+    # empty AND this flag is False, startup fails with a ConfigError so
+    # accidentally-public bots can't slip into production. Setting this
+    # to True is logged at INFO on every boot so the deviation is
+    # visible in journalctl.
+    allow_any_user: bool = False
     message_overflow: Literal["trim", "split"] = "split"
     voice_transcription: bool = False
     voice_max_bytes: StrictInt = 10 * 1024 * 1024
     voice_transcription_model: NonEmptyStr = "gpt-4o-mini-transcribe"
     voice_transcription_base_url: NonEmptyStr | None = None
-    voice_transcription_api_key: NonEmptyStr | None = None
+    # #378: SecretStr (parity with bot_token from #196) — masks repr()/str()/
+    # tracebacks/structlog. Access the raw value via .get_secret_value() at the
+    # transport boundary (telegram/loop.py before passing to OpenAI SDK).
+    voice_transcription_api_key: SecretStr | None = None
     voice_show_transcription: bool = True
     session_mode: Literal["stateless", "chat"] = "stateless"
     show_resume_line: bool = True
@@ -142,6 +157,42 @@ class TelegramTransportSettings(BaseModel):
         if not token:
             raise ValueError("bot_token must not be empty")
         return SecretStr(token)
+
+    @field_validator("voice_transcription_api_key", mode="after")
+    @classmethod
+    def _validate_voice_key_not_empty(cls, v: SecretStr | None) -> SecretStr | None:
+        """#378: preserve the pre-SecretStr `NonEmptyStr | None` contract.
+        Empty / whitespace-only strings round-trip to None so downstream code
+        can use a simple `is not None` (or truthy) check at the call site."""
+        if v is None:
+            return None
+        key = v.get_secret_value().strip()
+        if not key:
+            return None
+        return SecretStr(key)
+
+    @model_validator(mode="after")
+    def _validate_allowed_user_ids_or_optin(self) -> TelegramTransportSettings:
+        """#377: refuse to start with no user allowlist unless the operator
+        explicitly opts out.
+
+        ``allowed_user_ids = []`` previously degraded to "any Telegram user
+        who knows the bot username can send commands" with only a runtime
+        warning. That's an insecure default — it shipped real production
+        bots that were silently public. The fix promotes the warning to a
+        hard ConfigError at config-load time. Operators who actually want
+        an open bot (demos, hackathons, dev) opt in by setting
+        ``allow_any_user = true``.
+        """
+        if not self.allowed_user_ids and not self.allow_any_user:
+            raise ValueError(
+                "[transports.telegram] allowed_user_ids is empty — bot would "
+                "accept commands from anyone who knows its username. Set a "
+                "non-empty list of Telegram user IDs, or pass "
+                "`allow_any_user = true` to opt in to an open bot (dev/demo "
+                "only)."
+            )
+        return self
 
 
 class TransportsSettings(BaseModel):
@@ -174,6 +225,28 @@ class CostBudgetSettings(BaseModel):
     max_cost_per_day: float | None = Field(default=None, ge=0)
     warn_at_pct: int = Field(default=70, ge=0, le=100)
     auto_cancel: bool = False
+
+
+class LoopSettings(BaseModel):
+    """Untether-side observation of Claude Code's session-scoped scheduling
+    tools (CronCreate, ScheduleWakeup) so /loop and dynamic-mode wakeups
+    keep firing after the subprocess exits.  Off by default — opt-in
+    per-chat via /config → 🔁 Loop mode (#289).
+
+    Cost limits are NOT in [loop]; they live in [cost_budget] and apply
+    to loop fires automatically.  The caps below are runaway-safety
+    only.
+    """
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    enabled: bool = False
+    inline_threshold_seconds: int = Field(default=300, ge=0)
+    redundancy_check_interval: int = Field(default=30, ge=1)
+    max_iterations: int = Field(default=20, ge=1, le=10000)
+    max_total_duration_hours: int = Field(default=4, ge=1, le=168)
+    min_interval_seconds: int = Field(default=60, ge=60)
+    expiry_days: int = Field(default=7, ge=1, le=30)
 
 
 class FooterSettings(BaseModel):
@@ -235,6 +308,13 @@ class WatchdogSettings(BaseModel):
     # it causes Claude Code to re-probe its catalog is empirical, so default
     # OFF until staging measurement confirms the UX benefit.
     notify_catalog_refresh: bool = False
+    # #497 debounce: minimum seconds between consecutive
+    # ``catalog.refresh_sent`` fires per session. Without this, a session
+    # with many rapid ``tool_result`` batches (observed: 183 fires in a
+    # single 'scout' run) generates a flood of ``mcp_status`` requests on
+    # the runner's stdin. Set to 0 to disable the debounce and restore the
+    # pre-#497 behaviour of one fire per ``tool_result`` batch.
+    catalog_refresh_min_interval_s: float = Field(default=5.0, ge=0.0, le=60.0)
 
     # Pre-spawn RAM guard (#350) — refuse or warn on new engine subprocesses
     # when the host is near-OOM. 0 disables that tier; set both to 0 to
@@ -242,6 +322,41 @@ class WatchdogSettings(BaseModel):
     # when both are set, enforced by a model_validator below (see #350).
     prespawn_ram_warn_mb: int = Field(default=2000, ge=0, le=65536)
     prespawn_ram_block_mb: int = Field(default=500, ge=0, le=65536)
+
+    # #438: user-configurable Claude SSE-stream watchdog. Sets
+    # ``CLAUDE_STREAM_IDLE_TIMEOUT_MS`` for the Claude subprocess (via
+    # ``setdefault`` — shell-set values still win). Default 300000 ms (5 min)
+    # matches the upstream undici idle-body timeout and #342's reasoning.
+    # Long-form opus 4.7 1M plan-mode generations can legitimately idle the
+    # SSE stream past 5 min; deployments that hit upstream Anthropic API
+    # stalls (#438) can raise this to 600000-900000 to ride out longer
+    # silences before Untether reports the run failed. Range 30s-30min.
+    claude_stream_idle_timeout_ms: int = Field(default=300_000, ge=30_000, le=1_800_000)
+
+    # #333: post-result idle timeout for Claude bidirectional sessions.
+    # Claude Code in stream-json + permission-mode keeps stdin open after
+    # emitting a `result` event so multi-turn sessions don't re-spawn. In
+    # practice this leaves a 400 MB RSS subprocess + ~200 TCP sockets
+    # idling for tens of minutes between user prompts. After
+    # `post_result_idle_timeout` seconds with no new event we close the
+    # subprocess's stdin so the CLI exits gracefully (rc=0). The auto-
+    # continue safety gate already excludes ``last_event_type == "result"``
+    # so the clean exit will not phantom-resume the session. Pause/resume
+    # via Telegram is unaffected — the resume token is preserved on the
+    # progress tracker. Set ``post_result_idle_enabled = false`` to keep
+    # the legacy "stay alive forever" behaviour (e.g. for users who pipe
+    # successive turns within seconds and want to skip the spawn cost).
+    # Range 30s-1h.
+    post_result_idle_enabled: bool = True
+    post_result_idle_timeout: float = Field(default=600.0, ge=30, le=3600)
+
+    # #481: grace window for fresh Bash/BashOutput tool calls. When the most
+    # recent action is Bash/BashOutput/KillShell and its age is less than
+    # bash_grace_seconds, ProgressEdits._stall_monitor suppresses the Telegram
+    # stall warning (the command may still be in its startup phase / first
+    # poll cycle). Range 5s-300s. Logged as
+    # ``progress_edits.stall_bash_grace_suppressed`` per suppression.
+    bash_grace_seconds: float = Field(default=60.0, ge=5, le=300)
 
     @model_validator(mode="after")
     def _validate_prespawn_ram_ordering(self) -> WatchdogSettings:
@@ -267,20 +382,67 @@ class ProgressSettings(BaseModel):
     max_actions: int = Field(default=5, ge=0, le=50)
     min_render_interval: float = Field(default=2.0, ge=0, le=30)
     group_chat_rps: float = Field(default=20.0 / 60.0, gt=0, le=10)
+    # #481: heartbeat tick cadence for the long-running-action elapsed-time
+    # tail and the post-result closing-message poller. Distinct from the
+    # stall-monitor cadence (60s) because lowering that would silently
+    # break stall_repeat_seconds=180 ≈ 3-tick math and the wider stall test
+    # corpus. The stall monitor's loop sleeps min(heartbeat_interval,
+    # stall_check_interval) and only runs the threshold check at the slower
+    # cadence. Range 5s-120s.
+    heartbeat_interval: float = Field(default=30.0, ge=5, le=120)
+
+
+_ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 
 
 class SecuritySettings(BaseModel):
-    """Runtime security knobs (#361).
+    """Runtime security knobs (#361, #409).
 
     ``env_audit`` enables a one-shot ``/proc/<pid>/environ`` sample on
     Claude session start. Disallowed names emit a structured warning so
     the operator can see when host env leaks past
     :func:`utils.env_policy.filtered_env`.
+
+    ``env_extra_allow`` / ``env_extra_prefix_allow`` (#409) extend the
+    built-in subprocess-env allowlist with per-deployment names so users
+    can thread credential-manager tokens (1Password, Doppler, Vault,
+    Infisical, …) without forking ``utils/env_policy.py``.
     """
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     env_audit: bool = True
+    # #409: user-extensible engine-subprocess env allowlist. Each entry
+    # must look like a POSIX env var name (uppercase, digits, underscore;
+    # must not start with a digit). Empty/whitespace strings are rejected
+    # so a stray TOML edit doesn't silently widen the allowlist.
+    env_extra_allow: list[str] = Field(default_factory=list)
+    env_extra_prefix_allow: list[str] = Field(default_factory=list)
+
+    @field_validator("env_extra_allow", "env_extra_prefix_allow", mode="after")
+    @classmethod
+    def _validate_env_names(cls, v: list[str]) -> list[str]:
+        """Each entry must look like a POSIX env-var name.
+
+        Trailing wildcards / glob chars are NOT supported — prefix matches
+        already cover families (``VAULT_*`` is configured as ``"VAULT_"``).
+        """
+        cleaned: list[str] = []
+        for entry in v:
+            if not isinstance(entry, str):
+                raise ValueError(
+                    f"env allowlist entries must be strings (got {type(entry).__name__})"
+                )
+            stripped = entry.strip()
+            if not stripped:
+                raise ValueError("env allowlist entries must not be empty")
+            if not _ENV_NAME_RE.match(stripped):
+                raise ValueError(
+                    f"invalid env name {entry!r} — must match [A-Z_][A-Z0-9_]* "
+                    "(uppercase letters, digits, underscores; cannot start with a digit)"
+                )
+            cleaned.append(stripped)
+        return cleaned
 
 
 class UntetherSettings(BaseSettings):
@@ -301,6 +463,7 @@ class UntetherSettings(BaseSettings):
 
     plugins: PluginsSettings = Field(default_factory=PluginsSettings)
     cost_budget: CostBudgetSettings = Field(default_factory=CostBudgetSettings)
+    loop: LoopSettings = Field(default_factory=LoopSettings)
     footer: FooterSettings = Field(default_factory=FooterSettings)
     preamble: PreambleSettings = Field(default_factory=PreambleSettings)
     progress: ProgressSettings = Field(default_factory=ProgressSettings)
@@ -556,7 +719,10 @@ def _load_settings_from_path(cfg_path: Path) -> UntetherSettings:
     )
     try:
         settings = Bound()
-        logger.info("config.loaded", path=str(cfg_path))
+        # #498 — fires per-helper load (footer/watchdog/progress/auto_continue/
+        # preamble/budget) by design (#269 hot-reload); too noisy at INFO.
+        # See v0.35.4 issue for caching settings within handle_message.
+        logger.debug("config.loaded", path=str(cfg_path))
         return settings
     except ValidationError as exc:
         raise ConfigError(f"Invalid config in {cfg_path}: {exc}") from exc

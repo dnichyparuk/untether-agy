@@ -4,6 +4,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, cast
 
+from pydantic import SecretStr
+
 from ..context import RunContext
 from ..logging import get_logger
 from ..markdown import MarkdownFormatter, MarkdownParts
@@ -56,15 +58,26 @@ class TelegramPresenter:
         self._formatter = formatter or MarkdownFormatter()
         self._message_overflow = message_overflow
 
+    def refresh_progress_settings(self, progress: object) -> None:
+        """Push a fresh ``ProgressSettings`` snapshot into the formatter (#269).
+
+        Called per-run from the runner bridge so editing ``[progress]``
+        in ``untether.toml`` applies on the next message. Per-chat
+        ``/verbose`` overrides take precedence (they construct an
+        override formatter on demand from the refreshed defaults).
+        """
+        self._formatter.refresh_from(progress)
+
     def render_progress(
         self,
         state: ProgressState,
         *,
         elapsed_s: float,
         label: str = "working",
+        now: float | None = None,
     ) -> RenderedMessage:
         parts = self._formatter.render_progress_parts(
-            state, elapsed_s=elapsed_s, label=label
+            state, elapsed_s=elapsed_s, label=label, now=now
         )
         text, entities = prepare_telegram(parts)
         if _is_cancelled_label(label):
@@ -159,11 +172,16 @@ class TelegramBridgeConfig:
     voice_max_bytes: int = 10 * 1024 * 1024
     voice_transcription_model: str = "gpt-4o-mini-transcribe"
     voice_transcription_base_url: str | None = None
-    voice_transcription_api_key: str | None = None
+    # #378: SecretStr ferries the key without leaking it through repr/log.
+    voice_transcription_api_key: SecretStr | None = None
     voice_show_transcription: bool = True
     forward_coalesce_s: float = 1.0
     media_group_debounce_s: float = 1.0
     allowed_user_ids: tuple[int, ...] = ()
+    # #377: `allow_any_user=True` is the explicit opt-in for an open bot.
+    # Mirrors `TelegramTransportSettings.allow_any_user` so the loop can
+    # log on every boot (telegram/loop.py:security.allow_any_user).
+    allow_any_user: bool = False
     files: TelegramFilesSettings = field(default_factory=TelegramFilesSettings)
     chat_ids: tuple[int, ...] | None = None
     topics: TelegramTopicsSettings = field(default_factory=TelegramTopicsSettings)
@@ -191,6 +209,7 @@ class TelegramBridgeConfig:
         self.forward_coalesce_s = float(settings.forward_coalesce_s)
         self.media_group_debounce_s = float(settings.media_group_debounce_s)
         self.allowed_user_ids = tuple(settings.allowed_user_ids)
+        self.allow_any_user = bool(settings.allow_any_user)
         self.files = settings.files
 
 

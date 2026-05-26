@@ -13,12 +13,14 @@ import os
 import pty
 import re
 import shutil
+import signal
 import subprocess as subprocess_module
 import time
 import tty
 from collections import OrderedDict
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from datetime import UTC
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,7 @@ import anyio
 import msgspec
 
 from ..backends import EngineBackend, EngineConfig
+from ..config import ConfigError
 from ..events import EventFactory
 from ..logging import get_logger
 from ..model import (
@@ -63,6 +66,66 @@ DEFAULT_ALLOWED_TOOLS = ["Bash", "Read", "Edit", "Write"]
 _RESUME_RE = re.compile(
     r"(?im)^\s*`?claude\s+(?:--resume|-r)\s+(?P<token>[^`\s]+)`?\s*$"
 )
+
+# Flags that Untether sets on every spawn (stream-json I/O, resume tokens,
+# permission wiring). A user-supplied copy in `[claude].extra_args` would
+# either duplicate the arg or collide with Untether's expected value, so
+# `build_runner` rejects any entry matching this set or one of the equivalent
+# `key=value` prefixes below. Mirrors `codex._EXEC_ONLY_FLAGS` (#407).
+_RESERVED_FLAGS: frozenset[str] = frozenset(
+    {
+        "-p",
+        "--print",
+        "--output-format",
+        "--input-format",
+        "--resume",
+        "-r",
+        "--continue",
+        "-c",
+        "--permission-mode",
+        "--permission-prompt-tool",
+    }
+)
+_RESERVED_PREFIXES: tuple[str, ...] = (
+    "--output-format=",
+    "--input-format=",
+    "--resume=",
+    "--permission-mode=",
+    "--permission-prompt-tool=",
+)
+
+
+def _find_reserved_flag(extra_args: list[str]) -> str | None:
+    for arg in extra_args:
+        if arg in _RESERVED_FLAGS:
+            return arg
+        for prefix in _RESERVED_PREFIXES:
+            if arg.startswith(prefix):
+                return arg
+    return None
+
+
+def _load_env_extras() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """#409: read [security] env_extra_allow / env_extra_prefix_allow.
+
+    Best-effort — config errors must never block a run, so we swallow
+    them and fall back to the built-in defaults. Returns
+    ``(extra_exact, extra_prefix)``.
+    """
+    from ..settings import load_settings_if_exists
+
+    try:
+        result = load_settings_if_exists()
+        if result is None:
+            return ((), ())
+        settings, _ = result
+        return (
+            tuple(settings.security.env_extra_allow),
+            tuple(settings.security.env_extra_prefix_allow),
+        )
+    except Exception:  # noqa: BLE001 — never let config errors block a run
+        return ((), ())
+
 
 # Phase 2: Global registry for active ClaudeRunner instances
 # Keyed by session_id, stores (runner_instance, timestamp)
@@ -126,6 +189,19 @@ _OUTLINE_MIN_CHARS = 200
 _PENDING_ASK_REQUESTS: dict[str, tuple[int, str]] = {}
 
 
+def is_session_alive(session_id: str) -> bool:
+    """Return True if a Claude subprocess for ``session_id`` is currently
+    running and has an open stdin (registered in :data:`_SESSION_STDIN`).
+
+    Used by :mod:`untether.loop_scheduler` (#289) before firing a loop
+    iteration, to avoid racing a still-live subprocess that may be parked
+    on a control_request awaiting Telegram button input.  Once the
+    subprocess exits its registry entry is cleared in :class:`ClaudeRunner`'s
+    ``run_impl`` finally block.
+    """
+    return session_id in _SESSION_STDIN
+
+
 @dataclass(slots=True)
 class AskQuestionState:
     """Tracks multi-question AskUserQuestion flow state."""
@@ -185,6 +261,13 @@ class ClaudeStreamState:
     max_text_len_since_cooldown: int = 0
     # Store outline text for embedding in synthetic approve/deny action
     outline_text: str | None = None
+    # #508 ExitPlanMode plan body — captured from the tool_use input on
+    # every ExitPlanMode call so the bridge can re-emit it as part of the
+    # final answer when the post-approval result is brief or empty
+    # (research/audit tasks where Claude has nothing left to say after
+    # the user approves).  Plan messages on Telegram are deleted on
+    # approve, so this is the only path to retain the body.
+    last_exitplanmode_plan: str | None = None
     # Cumulative seconds the session spent in Anthropic-side rate-limit waits (#349).
     # Sum of every rate_limit_event's retry_after_ms, so the cost footer can annotate
     # "(incl. Xm Ys rate-limited)" when a run finishes after one or more throttles.
@@ -211,6 +294,43 @@ class ClaudeStreamState:
     live_bg_agents: set[str] = field(default_factory=set)
     live_wakeups: dict[str, float] = field(default_factory=dict)
     live_remote_triggers: set[str] = field(default_factory=set)
+
+    # #544 ScheduleWakeup arm-time `delaySeconds` high-water-mark for the
+    # current turn. The rc11 #507 fix stored this per-tool_id in a sibling
+    # ``live_wakeups_arm_delay`` dict, but that dict was popped by
+    # ``_clear_background_handle`` on the ScheduleWakeup tool_result —
+    # which is the *schedule confirmation*, not a terminal signal — so by
+    # the time ``_post_result_idle_watchdog`` ticked (after the ``result``
+    # event, which lands AFTER tool_result) the dict was empty and the
+    # dead-wakeup shortcut never engaged. The scalar survives
+    # ``_clear_background_handle`` for the rest of the turn, then resets
+    # on the next user prompt (StreamUserMessage with non-tool_result
+    # content) or in ``new_state`` for fresh runs. ``max`` semantics so
+    # multiple ScheduleWakeup calls in one turn use the longest arm.
+    last_schedule_wakeup_arm_delay: float | None = None
+
+    # #333: per-turn high-water-mark monotonic timestamp of the most recent
+    # ``Bash(run_in_background=True)`` tool_use observed in this turn.
+    # Mirrors ``last_schedule_wakeup_arm_delay`` (#544): survives
+    # ``_clear_background_handle`` so the post-result idle watchdog tick log
+    # can see that a bg-bash was launched even after the tool_result pops
+    # the entry from ``live_bg_bashes``.
+    #
+    # CAVEAT: this is a LAUNCH tracker, not a LIFETIME tracker. A
+    # ``run_in_background=True`` Bash can outlive multiple user turns
+    # (long ``npm install``, ``tail -f``), so this scalar resets on every
+    # fresh user prompt. For true liveness, the bridge already uses
+    # ``_has_fresh_bash_output`` / ``_has_recent_bash_action``
+    # (runner_bridge.py:1738, 1753) — DO NOT replace those with this
+    # scalar. Observability-only today; suppression semantics for bg-bash
+    # are out of scope until the #374 lifecycle refactor.
+    last_bg_bash_launched_at: float | None = None
+
+    # #289 — first user message text for the run.  Populated by ``new_state``
+    # from the prompt arg.  Used as the fallback for the
+    # ``<<autonomous-loop-dynamic>>`` sentinel when ScheduleWakeup is
+    # observed without an explicit ``prompt`` field (Probe 3 result).
+    first_user_message_text: str | None = None
 
     # #361 env-leak audit: pid populated by ClaudeRunner.run_impl after
     # spawn so translate_claude_event can sample /proc/<pid>/environ in
@@ -247,6 +367,71 @@ class ClaudeStreamState:
     # colliding with Claude Code's own ``req_*`` namespace.
     pending_catalog_refresh_ids: list[str] = field(default_factory=list)
     catalog_refresh_seq: int = 0
+    # #497: debounce gate. Holds the ``time.monotonic()`` timestamp of the
+    # last enqueued refresh; the translate path skips re-enqueue while
+    # ``(now - last) < catalog_refresh_min_interval_s``. None until the
+    # first fire so the very first tool_result batch always queues.
+    last_catalog_refresh_queued_at: float | None = None
+    # Configured per-session interval mirrored from
+    # ``WatchdogSettings.catalog_refresh_min_interval_s`` at session init
+    # so translate() doesn't reach back into settings on every event.
+    catalog_refresh_min_interval_s: float = 5.0
+
+    # #333: monotonic timestamp of the most recent ``result`` event. The
+    # post-result idle watchdog (``ClaudeRunner._post_result_idle_watchdog``)
+    # polls this to decide when to close stdin. None until the first
+    # result lands; reset on each subsequent result so that a multi-turn
+    # bidirectional session re-arms the timer on every turn boundary.
+    result_received_at: float | None = None
+
+    # #470: cross-layer signals from _post_result_idle_watchdog → bridge.
+    # The watchdog stamps ``post_result_closed_at`` (monotonic) and
+    # ``post_result_idle_minutes`` immediately before closing stdin.
+    # ``ProgressEdits._stall_monitor`` polls these via engine_state
+    # duck-typing (mirrors the pattern at runner_bridge.py:1426 for
+    # ``has_live_background_work``) and fires a one-shot Telegram closing
+    # message with the elapsed-minutes wording, then sets
+    # ``post_result_closing_sent`` so subsequent ticks no-op (idempotent).
+    post_result_closed_at: float | None = None
+    post_result_idle_minutes: float = 0.0
+    post_result_closing_sent: bool = False
+
+
+def _derive_retry_after_s(info: claude_schema.RateLimitInfo | None) -> float | None:
+    """#518: when `rate_limit_event` omits `retry_after_ms`, fall back to the
+    earlier of `requests_reset` / `tokens_reset` ISO timestamps.
+
+    Returns the seconds-until-reset (clamped ≥ 0) so the chat can show
+    "retrying in N s" and `state.rate_limit_total_s` accumulates correctly,
+    even when upstream sends only the reset-window form documented in
+    `docs/reference/runners/claude/stream-json-cheatsheet.md`. Returns None
+    if no parseable timestamp is present, in which case the caller continues
+    to render the generic "waiting to retry" copy.
+    """
+    if info is None:
+        return None
+    from datetime import datetime
+
+    candidates: list[float] = []
+    for raw in (info.requests_reset, info.tokens_reset):
+        if not isinstance(raw, str) or not raw:
+            continue
+        try:
+            # `fromisoformat` (3.11+) handles "Z" suffix natively, but to keep
+            # parsing forgiving across CLI versions accept both spellings.
+            normalised = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+            dt = datetime.fromisoformat(normalised)
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        delta = (dt - datetime.now(UTC)).total_seconds()
+        candidates.append(max(0.0, delta))
+    if not candidates:
+        return None
+    # Choose the EARLIER reset (smaller delta) — the rate limit lifts as
+    # soon as one of the two budgets refills.
+    return min(candidates)
 
 
 def _normalize_tool_result(content: Any) -> str:
@@ -344,25 +529,232 @@ def _register_background_handle(
             state.live_monitors[tool_id] = 0.0
     elif tool_name == "Bash" and bool(raw_input.get("run_in_background")):
         state.live_bg_bashes.add(tool_id)
+        # #333: scalar high-water-mark that survives _clear_background_handle
+        # (see ClaudeStreamState.last_bg_bash_launched_at docstring). Used by
+        # the post-result idle watchdog tick log for observability only.
+        state.last_bg_bash_launched_at = time.monotonic()
     elif tool_name == "Agent" and bool(raw_input.get("run_in_background")):
         state.live_bg_agents.add(tool_id)
     elif tool_name == "ScheduleWakeup":
-        delay_ms = raw_input.get("delay_ms") or raw_input.get("timeout_ms")
-        if isinstance(delay_ms, (int, float)) and delay_ms > 0:
-            state.live_wakeups[tool_id] = time.monotonic() + (delay_ms / 1000.0)
+        # #481: the actual Claude Code ScheduleWakeup tool schema (per
+        # #289 / claude-agent-sdk-python) emits ``delaySeconds`` as the
+        # canonical field. Earlier versions of this code read
+        # ``delay_ms``/``timeout_ms`` only, which always missed in
+        # production (live_wakeups[tool_id] fell to 0.0 → countdown
+        # rendering broken, though membership-only suppression still
+        # worked). Read delaySeconds first; keep the legacy fallbacks so
+        # existing test fixtures parameterised on delay_ms still work.
+        #
+        # #544: also feed ``state.last_schedule_wakeup_arm_delay`` (a
+        # per-turn scalar high-water-mark) so the post-result idle
+        # watchdog's dead-wakeup shortcut survives the tool_result that
+        # immediately pops ``live_wakeups`` via ``_clear_background_handle``.
+        delay_seconds_raw = raw_input.get("delaySeconds")
+        arm_delay_s: float | None = None
+        if isinstance(delay_seconds_raw, (int, float)) and delay_seconds_raw > 0:
+            arm_delay_s = float(delay_seconds_raw)
+            state.live_wakeups[tool_id] = time.monotonic() + arm_delay_s
         else:
-            state.live_wakeups[tool_id] = 0.0
+            delay_ms = raw_input.get("delay_ms") or raw_input.get("timeout_ms")
+            if isinstance(delay_ms, (int, float)) and delay_ms > 0:
+                arm_delay_s = delay_ms / 1000.0
+                state.live_wakeups[tool_id] = time.monotonic() + arm_delay_s
+            else:
+                arm_delay_s = 0.0
+                state.live_wakeups[tool_id] = 0.0
+        # max(prev or 0, this) so multi-wakeup turns keep the longest arm
+        prev = state.last_schedule_wakeup_arm_delay or 0.0
+        state.last_schedule_wakeup_arm_delay = max(prev, arm_delay_s)
     elif tool_name == "RemoteTrigger":
         state.live_remote_triggers.add(tool_id)
 
 
 def _clear_background_handle(state: ClaudeStreamState, tool_use_id: str) -> None:
-    """Remove a background-task entry when its tool_result arrives (#347)."""
+    """Remove a background-task entry when its tool_result arrives (#347).
+
+    Note: ``state.last_schedule_wakeup_arm_delay`` and
+    ``state.last_bg_bash_launched_at`` are deliberately NOT cleared here.
+    A tool_result for ScheduleWakeup or ``Bash(run_in_background=True)``
+    is the arm/launch confirmation, not a terminal signal — the wakeup
+    fires later (or never, outside ``/loop dynamic mode``) and a
+    backgrounded bash continues running until it finishes. The
+    post-result idle watchdog (#507/#333) needs these scalars to
+    survive this clear so its diagnostic tick log can see them after
+    the matching ``result`` event lands. Both scalars reset on the
+    next user prompt or on ``new_state`` (#544, #333).
+    """
     state.live_monitors.pop(tool_use_id, None)
     state.live_bg_bashes.discard(tool_use_id)
     state.live_bg_agents.discard(tool_use_id)
     state.live_wakeups.pop(tool_use_id, None)
     state.live_remote_triggers.discard(tool_use_id)
+
+
+# ── /loop and ScheduleWakeup observation (#289) ─────────────────────────
+
+
+# Result-text patterns extracted in ``_observe_loop_tool_result``.
+# CronCreate / CronDelete share the ``\bjob ([0-9a-f]{8})\b`` form (Probe 5).
+_LOOP_CRON_ID_RE = re.compile(r"\bjob ([0-9a-f]{8})\b")
+# ScheduleWakeup result text reports the runtime-clamped delay as ``(in Ns)``.
+_LOOP_WAKEUP_DELAY_RE = re.compile(r"\(in (\d+)s\)")
+
+
+def _loop_enabled_for_chat(chat_id: int | None) -> bool:
+    """Resolve the /loop master toggle for a chat.
+
+    Resolution order (matches the design doc §5.0):
+
+    1. Per-chat override via ``EngineRunOptions.loop_enabled`` (set by
+       ``/config → 🔁 Loop mode``).  ``None`` means "follow global".
+    2. Global ``[loop] enabled`` from ``untether.toml``.
+    3. Hard fallback: ``False`` so a config error never accidentally
+       turns Loop mode on.
+
+    ``chat_id`` is currently advisory — the per-chat override lives in
+    the run-options contextvar set by ``executor.handle_engine_run``,
+    which is already chat-scoped.  We accept it so the call site reads
+    cleanly and so a future per-chat resolver can be wired in without
+    changing observer signatures.
+    """
+    options = get_run_options()
+    if options is not None and options.loop_enabled is not None:
+        return bool(options.loop_enabled)
+    try:
+        result = load_settings_if_exists()
+        if result is None:
+            return False
+        settings, _ = result
+        return bool(settings.loop.enabled)
+    except Exception:  # noqa: BLE001 — never let config errors turn loop ON
+        return False
+
+
+def _observe_loop_tool_use(
+    state: ClaudeStreamState,
+    content: claude_schema.StreamToolUseBlock,
+) -> None:
+    """Observe ``CronCreate`` / ``ScheduleWakeup`` / ``CronDelete``
+    ``tool_use`` events and register Untether-side loop entries (#289).
+
+    Sibling of :func:`_register_background_handle` — does NOT mutate
+    ``state.live_*`` registries.  Called after
+    :func:`_register_background_handle` so the rc8 ScheduleWakeup
+    countdown still works for short waits when Loop mode is OFF.
+    """
+    from ..utils.paths import get_run_channel_id
+
+    chat_id = get_run_channel_id()
+    if chat_id is None:
+        return  # not in a chat-scoped run (probes, ad-hoc spawns)
+    if not _loop_enabled_for_chat(chat_id):
+        return  # master toggle off → behave as today
+    tool_name = str(content.name or "")
+    tool_id = content.id
+    raw_input = content.input if isinstance(content.input, dict) else {}
+    session_id = state.factory.resume.value if state.factory.resume else None
+    if not session_id:
+        return  # session_id only known after system.init; tool_use shouldn't
+        # arrive before that, but guard defensively
+
+    from .. import loop_scheduler
+
+    if tool_name == "CronCreate":
+        # Probe 5: input field is `cron`, NOT `cron_expression`.  Lenient
+        # fallback to `cron_expression`/`schedule` in case the upstream
+        # schema gains aliases later.
+        cron_expr = (
+            raw_input.get("cron")
+            or raw_input.get("cron_expression")
+            or raw_input.get("schedule")
+        )
+        prompt = raw_input.get("prompt") or raw_input.get("text") or ""
+        recurring = bool(raw_input.get("recurring", True))
+        if not cron_expr or not prompt:
+            return
+        try:
+            loop_scheduler.register_pending_cron(
+                session_id=session_id,
+                tool_use_id=tool_id,
+                cron_expression=str(cron_expr),
+                prompt=str(prompt),
+                recurring=recurring,
+                chat_id=int(chat_id),
+                fallback_first_user_message=state.first_user_message_text,
+            )
+        except loop_scheduler.LoopSchedulerError as exc:
+            logger.warning(
+                "loop.observe.cron_register_failed",
+                session=session_id,
+                error=str(exc),
+            )
+    elif tool_name == "ScheduleWakeup":
+        # Probe 5: minimum delaySeconds = 60 (runtime clamps shorter values).
+        delay_seconds_raw = raw_input.get("delaySeconds")
+        if not isinstance(delay_seconds_raw, (int, float)) or delay_seconds_raw <= 0:
+            return
+        # Inline threshold — short waits stay rendered live by the
+        # rc8 countdown without an Untether-side timer (post-result
+        # watchdog won't reach them).
+        try:
+            settings_result = load_settings_if_exists()
+            inline_threshold = (
+                settings_result[0].loop.inline_threshold_seconds
+                if settings_result is not None
+                else 300
+            )
+        except Exception:  # noqa: BLE001
+            inline_threshold = 300
+        if delay_seconds_raw <= inline_threshold:
+            return
+        prompt = raw_input.get("prompt") or "<<autonomous-loop-dynamic>>"
+        try:
+            loop_scheduler.register_pending_wakeup(
+                session_id=session_id,
+                tool_use_id=tool_id,
+                delay_seconds=float(delay_seconds_raw),
+                prompt=str(prompt),
+                chat_id=int(chat_id),
+                fallback_first_user_message=state.first_user_message_text,
+            )
+        except loop_scheduler.LoopSchedulerError as exc:
+            logger.warning(
+                "loop.observe.wakeup_register_failed",
+                session=session_id,
+                error=str(exc),
+            )
+    elif tool_name == "CronDelete":
+        # Probe 5: input field is `id`, NOT `taskId`/`cronId`.
+        upstream_id = raw_input.get("id") or raw_input.get("taskId")
+        if upstream_id:
+            loop_scheduler.cancel_by_upstream_id(str(upstream_id))
+
+
+def _observe_loop_tool_result(
+    state: ClaudeStreamState,
+    tool_use_id: str,
+    result_content: object,
+) -> None:
+    """Observe ``CronCreate`` ``tool_result`` events and bind the upstream
+    8-character cron ID to the matching pending entry (#289).
+
+    Sibling of :func:`_clear_background_handle`.  Does nothing if no
+    matching entry exists (e.g. master toggle was off when tool_use was
+    observed).  Idempotent — bind_upstream_id is a no-op for unknown
+    tool_use_ids.
+    """
+    if not isinstance(result_content, str):
+        # tool_result.content can be list[dict] for multi-block results.
+        # CronCreate / ScheduleWakeup return free-form strings, so anything
+        # else is irrelevant.
+        return
+    from .. import loop_scheduler
+
+    match = _LOOP_CRON_ID_RE.search(result_content)
+    if match is None:
+        return
+    upstream_id = match.group(1)
+    loop_scheduler.bind_upstream_id(tool_use_id, upstream_id)
 
 
 def has_live_background_work(state: ClaudeStreamState) -> bool:
@@ -496,6 +888,51 @@ def _format_diff_preview(tool_name: str, tool_input: dict[str, Any]) -> str:
     return ""
 
 
+# #438: classify Stream idle timeout failures so the user sees actionable
+# context instead of just "API Error: Stream idle timeout - partial response
+# received". Two distinct upstream Anthropic API failure modes:
+#
+# - Type A — mid-generation stall: the model emitted some output, then went
+#   silent for >CLAUDE_STREAM_IDLE_TIMEOUT_MS. ``num_turns >= 1`` and
+#   ``duration_api_ms > 0``. Often legitimate long opus 4.7 1M plan-mode
+#   reasoning that exceeded the watchdog; raising the timeout helps.
+#
+# - Type B — cold-start zero-byte stall: zero bytes ever arrived. ``num_turns
+#   <= 1`` and ``duration_api_ms == 0``. The watchdog correctly detected an
+#   API outage from the client's perspective; raising the timeout does NOT
+#   help. Likely Anthropic API queueing / availability under load.
+#
+# See #438 for upstream tracking (consolidated `claude-code` issues
+# 2026-04-17→26).
+_STREAM_IDLE_TIMEOUT_PATTERN = "Stream idle timeout"
+
+
+def _classify_stream_idle_timeout(
+    event: claude_schema.StreamResultMessage,
+) -> str | None:
+    """Return a short Type-A / Type-B annotation, or None if not a stall."""
+    result = event.result if isinstance(event.result, str) else ""
+    if _STREAM_IDLE_TIMEOUT_PATTERN not in result:
+        return None
+    if event.num_turns <= 1 and (
+        event.duration_api_ms is None or event.duration_api_ms == 0
+    ):
+        # Type B — cold-start zero-byte stall. No bytes from API.
+        return (
+            "🌐 Cold-start API stall (Type B): Anthropic API returned no "
+            "bytes within the watchdog window. Likely upstream API "
+            "queueing/availability — raising CLAUDE_STREAM_IDLE_TIMEOUT_MS "
+            "will NOT help. Retry shortly."
+        )
+    # Type A — mid-generation stall. Model emitted output then went silent.
+    return (
+        "⏳ Mid-generation API stall (Type A): SSE stream went silent after "
+        "partial output. Often legitimate long reasoning that exceeded the "
+        "watchdog — consider raising [watchdog] claude_stream_idle_timeout_ms "
+        "in untether.toml."
+    )
+
+
 def _extract_error(
     event: claude_schema.StreamResultMessage,
     *,
@@ -511,6 +948,11 @@ def _extract_error(
     else:
         first = "Claude Code run failed"
 
+    # #438: append a Type-A / Type-B annotation when the failure is a
+    # Stream idle timeout, so the operator can tell the two failure modes
+    # apart from the visible message alone.
+    classification = _classify_stream_idle_timeout(event)
+
     # Second line: diagnostic context
     parts: list[str] = []
     sid = event.session_id[:8] if event.session_id else None
@@ -524,7 +966,57 @@ def _extract_error(
     if event.duration_api_ms:
         parts.append(f"api: {event.duration_api_ms}ms")
 
-    return f"{first}\n{' · '.join(parts)}"
+    diagnostics = " · ".join(parts)
+    if classification is not None:
+        return f"{first}\n{diagnostics}\n\n{classification}"
+    return f"{first}\n{diagnostics}"
+
+
+_PREPEND_LENGTH_GATE = 600
+_PREPEND_BODY_CAP = 1500
+_PREPEND_BODY_TRUNC_SUFFIX = "\n\n…\n\n(plan truncated — shown in full during approval)"
+
+
+def _prepend_exitplanmode_plan(final_answer: str | None, plan_body: str | None) -> str:
+    """#508 Re-emit ExitPlanMode plan body in the final answer.
+
+    Called from the per-stream ``StreamResultMessage`` translation path
+    (#510) using ``state.last_exitplanmode_plan`` — correctly scoped to
+    this run's stream, not the shared ``runner.current_stream`` singleton.
+
+    #515 length-gate tuning (rc13). The original substring check
+    (``body in final_answer``) failed in practice because the rc11
+    preamble told Claude to *paraphrase* the plan post-approval rather
+    than literal-copy it, so the skip never triggered and Layer E
+    concatenated the full plan body in front of every well-behaved run
+    (42k-char Telegram messages on staging). The new preamble asks for a
+    brief CLI-style summary post-approval — when Claude obeys, the
+    answer is >600 chars and we skip the prepend; when Claude exits with
+    nothing substantive (the original #508 repro at 584 chars), the
+    length gate falls through and we prepend a capped plan body.
+
+    Skip rules (in order):
+    1. ``plan_body`` empty/whitespace → return final answer as-is.
+    2. ``final_answer`` already substantive (≥ ``_PREPEND_LENGTH_GATE``)
+       → skip prepend, post-approval text is doing the job.
+    3. Exact substring match → skip prepend (cheap belt-and-braces).
+    4. Otherwise prepend, truncating ``plan_body`` to
+       ``_PREPEND_BODY_CAP`` chars so a runaway plan body doesn't ship
+       a 30k-char final.
+    """
+    if not plan_body or not plan_body.strip():
+        return final_answer or ""
+    final = final_answer or ""
+    if len(final) >= _PREPEND_LENGTH_GATE:
+        return final
+    body = plan_body.strip()
+    if body in final:
+        return final
+    if len(body) > _PREPEND_BODY_CAP:
+        body = body[:_PREPEND_BODY_CAP].rstrip() + _PREPEND_BODY_TRUNC_SUFFIX
+    if final:
+        return f"📋 Plan (approved):\n\n{body}\n\n---\n\n{final}"
+    return f"📋 Plan (approved):\n\n{body}"
 
 
 def _maybe_audit_env(state: ClaudeStreamState, session_id: str) -> None:
@@ -550,7 +1042,15 @@ def _maybe_audit_env(state: ClaudeStreamState, session_id: str) -> None:
     if not enabled:
         return
 
-    leaked = audit_proc_env(state.pid, expected_extras=("UNTETHER_SESSION",))
+    # #409: pass user extras through so the audit doesn't flag names the
+    # operator explicitly opted into via [security] env_extra_allow.
+    user_exact, user_prefix = _load_env_extras()
+    leaked = audit_proc_env(
+        state.pid,
+        expected_extras=("UNTETHER_SESSION",),
+        user_extra_exact=user_exact,
+        user_extra_prefix=user_prefix,
+    )
     for name in leaked:
         if name in state.audited_leaks:
             continue
@@ -677,7 +1177,14 @@ def translate_claude_event(
             out: list[UntetherEvent] = []
             for content in message.content:
                 match content:
-                    case claude_schema.StreamToolUseBlock():
+                    case (
+                        claude_schema.StreamToolUseBlock()
+                        | claude_schema.StreamServerToolUseBlock()
+                    ):
+                        # #489 server_tool_use shares the tool_use translation —
+                        # _register_background_handle / _observe_loop_tool_use
+                        # filter on tool name and no-op for unrecognised server
+                        # tools (web_search, code_execution, computer_use, …).
                         action = _tool_action(
                             content,
                             parent_tool_use_id=parent_tool_use_id,
@@ -687,6 +1194,24 @@ def translate_claude_event(
                         # #347 track long-running primitives that outlive
                         # this tool_use → tool_result cycle
                         _register_background_handle(state, content)
+                        # #289 observe /loop and ScheduleWakeup tool calls
+                        # so Untether can re-fire after the subprocess exits
+                        # (master toggle gate inside).  Sibling of, not
+                        # replacement for, _register_background_handle.
+                        _observe_loop_tool_use(state, content)
+                        # #508 capture ExitPlanMode plan body so the bridge
+                        # can re-emit it in the final answer when the
+                        # post-approval result is brief/empty (research
+                        # tasks).  Only captures from the regular Approve
+                        # flow — Pause-and-Outline outlines go via
+                        # state.outline_text and a different code path.
+                        if str(content.name or "") == "ExitPlanMode":
+                            _epm_input = (
+                                content.input if isinstance(content.input, dict) else {}
+                            )
+                            _plan_body = _epm_input.get("plan")
+                            if isinstance(_plan_body, str) and _plan_body.strip():
+                                state.last_exitplanmode_plan = _plan_body
                         out.append(
                             factory.action_started(
                                 action_id=action.id,
@@ -739,13 +1264,30 @@ def translate_claude_event(
                 return []
             out: list[UntetherEvent] = []
             saw_tool_result = False
+            saw_non_tool_result = False
             for content in message.content:
-                if not isinstance(content, claude_schema.StreamToolResultBlock):
+                # #489 advisor_tool_result shares the tool_result translation.
+                if not isinstance(
+                    content,
+                    (
+                        claude_schema.StreamToolResultBlock,
+                        claude_schema.StreamAdvisorToolResultBlock,
+                    ),
+                ):
+                    # #544: any non-tool_result block signals a real user
+                    # prompt arrived (text, image, etc.) — reset the
+                    # ScheduleWakeup arm-delay high-water-mark so a new
+                    # turn that doesn't call ScheduleWakeup falls back
+                    # to the default post-result idle timeout.
+                    saw_non_tool_result = True
                     continue
                 saw_tool_result = True
                 tool_use_id = content.tool_use_id
                 # #347 clear any background-task entry for this tool_use_id
                 _clear_background_handle(state, tool_use_id)
+                # #289 bind upstream cron ID so CronDelete observations
+                # later in the session can target the right loop entry.
+                _observe_loop_tool_result(state, tool_use_id, content.content)
                 action = state.pending_actions.pop(tool_use_id, None)
                 if action is None:
                     action = Action(
@@ -772,18 +1314,41 @@ def translate_claude_event(
                             ok=True,
                         )
                     )
+            # #544: reset the ScheduleWakeup arm-delay high-water-mark when
+            # a fresh user prompt arrives (any non-tool_result content) and
+            # NO tool_result is present in the same batch. Mixed batches
+            # (rare in practice) keep the scalar — the tool turn is still
+            # in flight. The reset must happen here (not in StreamResultMessage)
+            # because the watchdog reads the scalar AFTER result_received_at
+            # is set, so resetting on result would defeat the shortcut.
+            if saw_non_tool_result and not saw_tool_result:
+                state.last_schedule_wakeup_arm_delay = None
+                # #333: same reset semantics as the #544 ScheduleWakeup
+                # scalar — a fresh user prompt clears the per-turn
+                # launch tracker. See last_bg_bash_launched_at docstring
+                # for why this is a launch tracker, not a lifetime
+                # tracker.
+                state.last_bg_bash_launched_at = None
             # #365 queue a proactive mcp_status nudge once per tool_result
             # batch. Opt-in via WatchdogSettings.notify_catalog_refresh.
             # Drained from stdin by ClaudeRunner._drain_catalog_refresh so
             # the send is fire-and-forget and cannot block translate().
+            # #497 debounce: skip the enqueue while the previous fire is
+            # within ``catalog_refresh_min_interval_s``. Set to 0 to disable.
             if saw_tool_result and state.notify_catalog_refresh:
                 resume_val = factory.resume.value if factory.resume else None
                 if resume_val:
-                    state.catalog_refresh_seq += 1
-                    request_id = (
-                        f"ut_catalog_refresh_{resume_val}_{state.catalog_refresh_seq}"
-                    )
-                    state.pending_catalog_refresh_ids.append(request_id)
+                    now = time.monotonic()
+                    last = state.last_catalog_refresh_queued_at
+                    interval = state.catalog_refresh_min_interval_s
+                    if last is None or interval <= 0 or (now - last) >= interval:
+                        state.catalog_refresh_seq += 1
+                        request_id = (
+                            f"ut_catalog_refresh_{resume_val}_"
+                            f"{state.catalog_refresh_seq}"
+                        )
+                        state.pending_catalog_refresh_ids.append(request_id)
+                        state.last_catalog_refresh_queued_at = now
             return out
         case claude_schema.StreamResultMessage():
             ok = not event.is_error
@@ -791,11 +1356,41 @@ def translate_claude_event(
             if ok and not result_text and state.last_assistant_text:
                 result_text = state.last_assistant_text
 
+            # #510 / #508: re-emit the ExitPlanMode plan body when the
+            # post-approval final answer is brief/empty. Done HERE on the
+            # per-stream path (state is per-run, correctly scoped) rather
+            # than in runner_bridge.handle_message against the shared
+            # runner.current_stream singleton — which raced across
+            # concurrent Claude chats and leaked plan bodies cross-chat.
+            if ok:
+                result_text = _prepend_exitplanmode_plan(
+                    result_text, state.last_exitplanmode_plan
+                )
+
             resume = ResumeToken(engine=ENGINE, value=event.session_id)
             error = None if ok else _extract_error(event, resumed=state.resumed)
             usage = _usage_payload(event)
 
-            return [
+            # #333: arm the post-result idle watchdog. Reset on every
+            # result (multi-turn re-arms the timer per turn boundary).
+            state.result_received_at = time.monotonic()
+
+            events_out: list[UntetherEvent] = []
+            # #333 UX signal #1: append "✓ turn complete" to the meta
+            # footer so the user immediately sees the turn is done and
+            # the session is now waiting for the next prompt. A
+            # supplementary StartedEvent with new meta is the supported
+            # pattern for late-arriving metadata (see
+            # .claude/rules/runner-development.md).
+            if ok:
+                events_out.append(
+                    factory.started(
+                        resume,
+                        title=None,
+                        meta={"complete": "✓ turn complete"},
+                    )
+                )
+            events_out.append(
                 factory.completed(
                     ok=ok,
                     answer=result_text,
@@ -803,9 +1398,49 @@ def translate_claude_event(
                     error=error,
                     usage=usage or None,
                 )
-            ]
+            )
+            return events_out
         case claude_schema.StreamControlRequest(request_id=request_id, request=request):
-            # Auto-approve non-user-facing control requests
+            # Auto-approve non-user-facing control requests.
+            #
+            # #380 — security audit (2026-04-27) verified the safety invariant
+            # for the two subtypes that look superficially scary:
+            #
+            # * `ControlMcpMessageRequest` (subtype=mcp_message). Carries
+            #   `server_name: str` + `message: Any`. Untether NEVER inspects
+            #   or executes the `message` payload — it auto-acknowledges and
+            #   the payload flows through Claude Code to the model, where
+            #   model-initiated tool calls still pass through the standard
+            #   `ControlCanUseToolRequest` gate (and ExitPlanMode / interactive
+            #   approval where applicable). A compromised MCP server CAN send
+            #   tainted prompts via this channel, but that's the inherent
+            #   threat model of any MCP server — not specific to auto-approve.
+            #   Routing this through Telegram approval would not block the
+            #   payload (it's already in-flight) — it would just delay the
+            #   acknowledgement, with no security gain.
+            #
+            # * `ControlRewindFilesRequest` (subtype=rewind_files). Carries
+            #   `user_message_id: str`. Rewind is initiated by the user via
+            #   the Claude CLI's `/rewind` slash command (or programmatic
+            #   equivalent) — the model cannot autonomously trigger rewind
+            #   in upstream Claude Code 2.1.x. Untether currently has no UI
+            #   that issues `/rewind`, so this control_request only fires
+            #   when the user types `/rewind` themselves in a chat; the user
+            #   has already consented. If a future release exposes rewind
+            #   via Telegram UI, that UI's command handler should provide
+            #   the gate, not this control-channel layer. The denial state
+            #   that drove a prior approval/deny decision lives on the
+            #   parent (Untether) side in `_HANDLED_REQUESTS` /
+            #   `_PLAN_EXIT_APPROVED` — those are NOT mutated by rewind.
+            #
+            # The other three (initialize, hook_callback, interrupt) are
+            # protocol housekeeping with no payload that Untether interprets.
+            #
+            # Acceptance: changes to either subtype's semantics in upstream
+            # Claude Code MUST trigger a re-audit. Tests in
+            # tests/test_claude_control.py::TestAutoApproveSafetyInvariant
+            # lock in the expectation that auto-approve runs without
+            # invoking any callback that observes the payload.
             _AUTO_APPROVE_TYPES = (
                 claude_schema.ControlInitializeRequest,
                 claude_schema.ControlHookCallbackRequest,
@@ -1323,6 +1958,17 @@ def translate_claude_event(
             # status instead of silent inactivity + eventual mystery cancel.
             retry_ms = info.retry_after_ms if info is not None else None
             retry_s = retry_ms / 1000.0 if retry_ms is not None else None
+            # #518: when retry_after_ms is missing, derive retry_after_s from
+            # the requests_reset / tokens_reset ISO timestamps so subscription-
+            # cap throttles (which the rc13 audit showed always emit "bare"
+            # rate_limit_events) still surface an actionable wait time and
+            # accumulate into cumulative_s.
+            retry_s_source = "retry_after_ms"
+            if retry_s is None:
+                derived = _derive_retry_after_s(info)
+                if derived is not None:
+                    retry_s = derived
+                    retry_s_source = "reset_ts"
             if retry_s is not None:
                 state.rate_limit_total_s += retry_s
             state.rate_limit_count += 1
@@ -1342,11 +1988,30 @@ def translate_claude_event(
                     detail["requests_remaining"] = info.requests_remaining
                 if retry_ms is not None:
                     detail["retry_after_ms"] = retry_ms
+            # #518: log all RateLimitInfo fields when present so future audits
+            # can see what upstream actually sent, instead of having to back-
+            # infer from the single-field log line that was here before.
+            info_payload: dict[str, Any] = {}
+            if info is not None:
+                for field_name in (
+                    "requests_limit",
+                    "requests_remaining",
+                    "requests_reset",
+                    "tokens_limit",
+                    "tokens_remaining",
+                    "tokens_reset",
+                    "retry_after_ms",
+                ):
+                    value = getattr(info, field_name, None)
+                    if value is not None:
+                        info_payload[field_name] = value
             logger.info(
                 "claude.rate_limit_event",
                 retry_after_s=retry_s,
+                retry_after_source=retry_s_source if retry_s is not None else None,
                 count=state.rate_limit_count,
                 cumulative_s=state.rate_limit_total_s,
+                info=info_payload or None,
             )
             return [
                 factory.action_started(
@@ -1381,6 +2046,7 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
     model: str | None = None
     permission_mode: str | None = None
     allowed_tools: list[str] | None = None
+    extra_args: list[str] = field(default_factory=list)
     dangerously_skip_permissions: bool = False
     use_api_billing: bool = False
     session_title: str = "claude"
@@ -1392,6 +2058,12 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
     _proc_stdin: Any | None = None  # PIPE stdin for control channel (permission mode)
     _control_timeout_seconds: float = CONTROL_REQUEST_TIMEOUT_SECONDS
     _max_pending_control_requests: int = 100
+    # #333 Tier 1 / Tier 3: subcountdown tuning constants. Class-level so
+    # tests can override via monkeypatch without touching production code.
+    _subcountdown_poll_interval_s: float = 5.0
+    _subcountdown_limbo_detect_threshold_s: float = 30.0
+    _subcountdown_sigterm_grace_s: float = 5.0
+    _subcountdown_sigterm_grace_poll_s: float = 0.5
 
     def format_resume(self, token: ResumeToken) -> str:
         if token.engine != ENGINE:
@@ -1551,6 +2223,12 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                 "--verbose",
             ]
 
+        # User-supplied CLI flags (e.g. `--chrome` to opt into Claude-in-Chrome).
+        # Must sit after the Untether-managed I/O prelude but before
+        # resume / model / effort / allowed-tools / permission so the final
+        # prompt position (after `--`) is never displaced (#407).
+        args.extend(self.extra_args)
+
         if resume is not None:
             if resume.is_continue:
                 args.append("--continue")
@@ -1631,9 +2309,13 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         # MCP namespaces, etc.) flow through. See env_policy.py for the
         # canonical list + how to extend it when a new MCP or engine needs
         # an unfamiliar variable.
-        from ..utils.env_policy import filtered_env
+        from ..utils.env_policy import filtered_env, log_user_extensions_once
 
-        env = filtered_env()
+        # #409: thread per-deployment extras from
+        # [security] env_extra_allow / env_extra_prefix_allow.
+        extra_exact, extra_prefix = _load_env_extras()
+        log_user_extensions_once(extra_exact, extra_prefix)
+        env = filtered_env(extra_allow=extra_exact, extra_prefix=extra_prefix)
         # Let Claude Code hooks detect Untether sessions (e.g. PitchDocs
         # context-guard skips blocking Stop hooks in Telegram).
         env["UNTETHER_SESSION"] = "1"
@@ -1649,7 +2331,22 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         # matches the undici idle-body timeout that motivated #322 *and*
         # Untether's own `stuck_after_tool_result_timeout` default, so the
         # upstream CLI watchdog and our detector fire in the same window.
-        env.setdefault("CLAUDE_STREAM_IDLE_TIMEOUT_MS", "300000")
+        # #438: now user-configurable via [watchdog] claude_stream_idle_timeout_ms
+        # so deployments hitting upstream Anthropic API stalls can ride out
+        # longer silences. setdefault still respects shell-set overrides.
+        idle_timeout_default = "300000"
+        try:
+            result = load_settings_if_exists()
+            if result is not None:
+                settings, _ = result
+                idle_timeout_default = str(
+                    settings.watchdog.claude_stream_idle_timeout_ms
+                )
+        except Exception:  # noqa: BLE001 — settings errors must not block a run
+            logger.debug(
+                "claude_stream_idle_timeout.settings_load_failed", exc_info=True
+            )
+        env.setdefault("CLAUDE_STREAM_IDLE_TIMEOUT_MS", idle_timeout_default)
         env.setdefault("MCP_TOOL_TIMEOUT", "120000")
         env.setdefault("MAX_MCP_OUTPUT_TOKENS", "12000")
         if self.use_api_billing is not True:
@@ -1660,6 +2357,11 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         state = ClaudeStreamState()
         state.auto_approve_exit_plan_mode = self._effective_permission_mode() == "auto"
         state.resumed = resume is not None
+        # #289 capture the first user message so loop observers can fall back
+        # to it when ScheduleWakeup uses the <<autonomous-loop-dynamic>>
+        # sentinel.  For resumed runs this is the resume prompt (still better
+        # than letting the sentinel reach Claude verbatim).
+        state.first_user_message_text = prompt
         # #365 propagate MCP catalog observability knobs from WatchdogSettings.
         # Defaults on the dataclass already mirror WatchdogSettings defaults,
         # so a load failure is a safe no-op.
@@ -1671,6 +2373,9 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     settings.watchdog.detect_catalog_staleness
                 )
                 state.notify_catalog_refresh = settings.watchdog.notify_catalog_refresh
+                state.catalog_refresh_min_interval_s = (
+                    settings.watchdog.catalog_refresh_min_interval_s
+                )
         except Exception:  # noqa: BLE001 — settings errors must not block a run
             logger.warning("catalog_settings.load_failed", exc_info=True)
         return state
@@ -1952,6 +2657,492 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                 )
         state.pending_catalog_refresh_ids.clear()
 
+    async def _post_result_idle_watchdog(
+        self,
+        state: ClaudeStreamState,
+        this_proc_stdin: Any,
+        reader_done: anyio.Event,
+        run_logger: Any,
+        timeout_s: float,
+        proc: Any = None,
+        stream: Any = None,
+    ) -> None:
+        """Close stdin once the bidirectional CLI has been idle past the result.
+
+        After ``StreamResultMessage`` the Claude CLI stays alive in the
+        bidirectional/permission-mode protocol so multi-turn sessions don't
+        re-spawn. In practice (#333) this leaves a 400 MB RSS subprocess
+        plus ~200 TCP sockets idling for 30+ minutes between user prompts.
+
+        Mechanism: poll ``state.result_received_at``. When elapsed exceeds
+        ``timeout_s`` and no approval-state references the session, close
+        ``this_proc_stdin`` (same call as the normal-flow exit on line
+        2412). The CLI hits stdin EOF and exits gracefully (rc=0). The
+        auto-continue safety gate excludes ``last_event_type == "result"``
+        so the clean exit will not phantom-resume the session
+        (test_skips_result_event_type in test_exec_bridge.py locks this).
+
+        Approval-state guard: ``_REQUEST_TO_SESSION`` and
+        ``_PENDING_ASK_REQUESTS`` track in-flight callback responses. If
+        either has live entries for this session we re-arm the timer
+        rather than orphaning a button-click control_response that's
+        mid-flight.
+        """
+        # Poll often enough to react within a few seconds of the deadline,
+        # but not so often that we burn CPU on a fully idle session.
+        poll_interval = max(5.0, min(timeout_s / 20.0, 30.0))
+
+        # #333 instrumentation. channelo rc15→rc16 hit a 43+ min post-result
+        # hang where this watchdog silently failed to fire (no
+        # ``closing_stdin`` / ``deferred`` log lines despite elapsed ≫
+        # ``timeout_s``). The four candidate causes from the original
+        # memory note are (1) ``result_received_at`` never set, (2)
+        # ``post_result_idle_enabled`` evaluated False, (3)
+        # ``reader_done`` set early, (4) task crashed silently or never
+        # started. Without entry/exit/tick logs we can't discriminate
+        # them. These logs are intentionally verbose for rc17 — at 30 s
+        # poll x hours of session = O(120) lines, trivial; rate-limiting
+        # now would create ambiguity in the next reproduction.
+        #
+        # Exception strategy mirrors ``_subprocess_watchdog``
+        # (src/untether/runner.py:1010-1079) and
+        # ``_drain_catalog_refresh`` (above): per-tick ``try/except``
+        # log-and-continue so a transient error (e.g. a flaky structlog
+        # ProcessorChain) never cancels the sibling ``_iter_jsonl_events``
+        # task in the task group and aborts the user's in-flight turn.
+        # The outer ``try/finally`` lets us tag the ``task_exited`` log
+        # with the reason for diagnostics.
+        sid_at_start = (
+            state.factory.resume.value if state.factory.resume is not None else None
+        )
+        run_logger.info(
+            "claude.post_result_idle.task_started",
+            session_id=sid_at_start,
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval,
+        )
+        exit_reason = "loop_exited"
+        try:
+            # #333 Tier 1 entry check: if ``reader_done`` is already set
+            # before the first poll (e.g. the JSONL reader finished
+            # extremely quickly), still run the subcountdown if the
+            # subprocess is alive. Mirrors the mid-loop check below.
+            if reader_done.is_set():
+                sid_now = (
+                    state.factory.resume.value
+                    if state.factory.resume is not None
+                    else None
+                )
+                if proc is not None and proc.returncode is None:
+                    exit_reason = await self._post_result_subcountdown(
+                        state=state,
+                        proc=proc,
+                        run_logger=run_logger,
+                        timeout_s=timeout_s,
+                        stream=stream,
+                        session_id=sid_now,
+                    )
+                    return
+                exit_reason = "reader_done"
+                return
+            while not reader_done.is_set():
+                try:
+                    await anyio.sleep(poll_interval)
+                    if reader_done.is_set():
+                        # #333 Tier 1: the JSONL reader exhausted — either
+                        # because the subprocess emitted CompletedEvent and
+                        # is exiting (the happy path), or because Claude
+                        # Code v2.1.143 closed stdout while keeping the
+                        # subprocess alive (the limbo path). Before rc18
+                        # the watchdog returned here, bypassing the 600 s
+                        # countdown and leaving the subprocess + MCP
+                        # children to idle for 30+ min until the user
+                        # cancelled. Now we check if the subprocess is
+                        # still alive and, if so, enter a stdout-closed
+                        # subcountdown.
+                        sid_now = (
+                            state.factory.resume.value
+                            if state.factory.resume is not None
+                            else None
+                        )
+                        if proc is not None and proc.returncode is None:
+                            exit_reason = await self._post_result_subcountdown(
+                                state=state,
+                                proc=proc,
+                                run_logger=run_logger,
+                                timeout_s=timeout_s,
+                                stream=stream,
+                                session_id=sid_now,
+                            )
+                            return
+                        exit_reason = "reader_done"
+                        return
+                    armed_at = state.result_received_at
+                    if armed_at is None:
+                        # Pre-result: tick log still useful so we can
+                        # confirm the watchdog is alive even before the
+                        # first ``result`` event lands.
+                        run_logger.info(
+                            "claude.post_result_idle.tick",
+                            session_id=(
+                                state.factory.resume.value
+                                if state.factory.resume is not None
+                                else None
+                            ),
+                            armed=False,
+                            elapsed_s=None,
+                            effective_timeout_s=None,
+                            dead_wakeup=False,
+                            pending_requests=0,
+                            pending_asks=0,
+                            would_close=False,
+                            last_bg_bash_launched_at_age_s=None,
+                            last_schedule_wakeup_arm_delay=(
+                                state.last_schedule_wakeup_arm_delay
+                            ),
+                        )
+                        continue
+                    elapsed = time.monotonic() - armed_at
+
+                    # #507: dead-ScheduleWakeup shortcut. ScheduleWakeup
+                    # outside ``/loop dynamic mode`` is a silent no-op
+                    # upstream — the wakeup never fires, the agent's turn
+                    # ended, and we'd otherwise wait the full
+                    # ``timeout_s`` (default 600 s) before closing stdin.
+                    # Detect the case via the scalar
+                    # ``state.last_schedule_wakeup_arm_delay`` (a
+                    # per-turn high-water-mark that survives
+                    # ``_clear_background_handle``, #544) and the /loop
+                    # master toggle for this chat; cut the effective
+                    # timeout to ``max_armed_delay + 60s grace`` so the
+                    # session closes within ~delay+grace instead of 10
+                    # minutes.
+                    effective_timeout = timeout_s
+                    dead_wakeup = False
+                    if state.last_schedule_wakeup_arm_delay is not None:
+                        from ..utils.paths import get_run_channel_id
+
+                        _chat_id = get_run_channel_id()
+                        if _chat_id is not None and not _loop_enabled_for_chat(
+                            _chat_id
+                        ):
+                            _max_delay = state.last_schedule_wakeup_arm_delay
+                            effective_timeout = min(timeout_s, _max_delay + 60.0)
+                            dead_wakeup = True
+
+                    # Locate the session id for the approval-state guard.
+                    # The Claude factory's resume token is set during the
+                    # very first StartedEvent, so by the time a result
+                    # lands we always have one — but defend against the
+                    # rare race where the watchdog ticks before that
+                    # first started event.
+                    sid = (
+                        state.factory.resume.value
+                        if state.factory.resume is not None
+                        else None
+                    )
+                    pending_requests = (
+                        [k for k, v in _REQUEST_TO_SESSION.items() if v == sid]
+                        if sid
+                        else []
+                    )
+                    pending_asks = (
+                        [
+                            k
+                            for k in _PENDING_ASK_REQUESTS
+                            if _REQUEST_TO_SESSION.get(k) == sid
+                        ]
+                        if sid
+                        else []
+                    )
+                    bg_bash_age = (
+                        round(time.monotonic() - state.last_bg_bash_launched_at, 1)
+                        if state.last_bg_bash_launched_at is not None
+                        else None
+                    )
+
+                    # #333 tick log. ``would_close`` answers "if we
+                    # weren't deferring, would this tick close stdin?" —
+                    # useful for spotting cases where the timer is
+                    # repeatedly re-armed.
+                    would_close = elapsed >= effective_timeout and not (
+                        pending_requests or pending_asks
+                    )
+                    run_logger.info(
+                        "claude.post_result_idle.tick",
+                        session_id=sid,
+                        armed=True,
+                        elapsed_s=round(elapsed, 1),
+                        effective_timeout_s=round(effective_timeout, 1),
+                        dead_wakeup=dead_wakeup,
+                        pending_requests=len(pending_requests),
+                        pending_asks=len(pending_asks),
+                        would_close=would_close,
+                        last_bg_bash_launched_at_age_s=bg_bash_age,
+                        last_schedule_wakeup_arm_delay=(
+                            state.last_schedule_wakeup_arm_delay
+                        ),
+                    )
+
+                    if elapsed < effective_timeout:
+                        continue
+                    if pending_requests or pending_asks:
+                        run_logger.info(
+                            "claude.post_result_idle.deferred",
+                            session_id=sid,
+                            pending_requests=len(pending_requests),
+                            pending_asks=len(pending_asks),
+                            elapsed_s=round(elapsed, 1),
+                            timeout_s=timeout_s,
+                        )
+                        # Re-arm: push the deadline forward by one full
+                        # interval.
+                        state.result_received_at = time.monotonic()
+                        continue
+
+                    run_logger.info(
+                        "claude.post_result_idle.closing_stdin",
+                        session_id=sid,
+                        elapsed_s=round(elapsed, 1),
+                        timeout_s=timeout_s,
+                        effective_timeout_s=round(effective_timeout, 1),
+                        dead_wakeup=dead_wakeup,
+                    )
+                    # #470: stamp closed-at signals BEFORE the actual
+                    # stdin close so the bridge's heartbeat tick (which
+                    # polls engine_state via duck-typing) can fire the
+                    # one-shot closing Telegram message.
+                    # ``post_result_closing_sent`` stays False — the
+                    # bridge sets it after the message is sent
+                    # (idempotency).
+                    state.post_result_closed_at = time.monotonic()
+                    state.post_result_idle_minutes = elapsed / 60.0
+                    with contextlib.suppress(Exception):
+                        await this_proc_stdin.aclose()
+                    exit_reason = "stdin_closed"
+                    return
+                except (anyio.get_cancelled_exc_class(), KeyboardInterrupt):
+                    # Cancellation must propagate so the task group can
+                    # tear down cleanly. The outer ``finally`` still
+                    # fires and tags ``exit_reason="cancelled"``.
+                    exit_reason = "cancelled"
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    # Tick-local failure: log + back off one interval to
+                    # avoid hot-looping on a persistent fault. The loop
+                    # continues — we MUST NOT let an unhandled exception
+                    # bubble into the task group and cancel the sibling
+                    # JSONL reader.
+                    run_logger.warning(
+                        "claude.post_result_idle.tick_error",
+                        session_id=(
+                            state.factory.resume.value
+                            if state.factory.resume is not None
+                            else None
+                        ),
+                        error=str(e),
+                        error_type=e.__class__.__name__,
+                        exc_info=True,
+                    )
+                    await anyio.sleep(poll_interval)
+        finally:
+            run_logger.info(
+                "claude.post_result_idle.task_exited",
+                session_id=(
+                    state.factory.resume.value
+                    if state.factory.resume is not None
+                    else None
+                ),
+                reason=exit_reason,
+            )
+
+    async def _post_result_subcountdown(
+        self,
+        *,
+        state: ClaudeStreamState,
+        proc: Any,
+        run_logger: Any,
+        timeout_s: float,
+        stream: Any = None,
+        session_id: str | None = None,
+    ) -> str:
+        """Watch a stdout-closed-but-process-alive subprocess (#333 Tier 1).
+
+        Entered when ``reader_done`` fires while ``proc.returncode is None`` —
+        the JSONL reader exhausted but the subprocess is still alive (Claude
+        Code v2.1.143 sometimes closes stdout without exiting). We wait up
+        to ``timeout_s`` for the subprocess to exit naturally; if it doesn't,
+        SIGTERM the process group, wait 5 s, then SIGKILL. Returns the
+        ``task_exited`` reason for the caller to record.
+
+        Tier 3: 30 s into the subcountdown, if the subprocess is still
+        alive and no real pending state references the session, emit
+        ``runner.limbo_detected`` warning. ``untether-issue-watcher``
+        picks this up automatically.
+        """
+        import os as _os
+
+        from ..utils.proc_diag import collect_proc_diag
+
+        reader_done_at = time.monotonic()
+        run_logger.info(
+            "claude.post_result_idle.reader_done_but_alive",
+            session_id=session_id,
+            pid=proc.pid,
+            elapsed_since_result_s=(
+                round(time.monotonic() - state.result_received_at, 1)
+                if state.result_received_at is not None
+                else None
+            ),
+            timeout_s=timeout_s,
+        )
+        if stream is not None:
+            self._transition_lifecycle(
+                stream, "reader_eof", run_logger, pid=proc.pid, session_id=session_id
+            )
+            self._transition_lifecycle(
+                stream,
+                "subcountdown",
+                run_logger,
+                pid=proc.pid,
+                session_id=session_id,
+                timeout_s=timeout_s,
+            )
+
+        # Poll loop: tick every ``_subcountdown_poll_interval_s`` up to
+        # ``timeout_s``, exit early if the subprocess dies naturally or
+        # pending state appears (in which case we re-arm and stay alive —
+        # the user is still interacting).
+        limbo_logged = False
+        deadline = reader_done_at + timeout_s
+        while True:
+            await anyio.sleep(self._subcountdown_poll_interval_s)
+            if proc.returncode is not None:
+                if stream is not None:
+                    self._transition_lifecycle(
+                        stream,
+                        "exited",
+                        run_logger,
+                        pid=proc.pid,
+                        session_id=session_id,
+                        rc=proc.returncode,
+                    )
+                return "subprocess_exited_during_subcountdown"
+
+            sid = (
+                state.factory.resume.value if state.factory.resume is not None else None
+            )
+            pending_requests = (
+                [k for k, v in _REQUEST_TO_SESSION.items() if v == sid] if sid else []
+            )
+            pending_asks = (
+                [k for k in _PENDING_ASK_REQUESTS if _REQUEST_TO_SESSION.get(k) == sid]
+                if sid
+                else []
+            )
+            if pending_requests or pending_asks:
+                # User is mid-interaction — re-arm the deadline so the
+                # subcountdown doesn't fire while a control_response is
+                # in flight. Match _post_result_idle_watchdog's deferred
+                # re-arm semantics (line 2843).
+                run_logger.info(
+                    "claude.post_result_idle.subcountdown_deferred",
+                    session_id=sid,
+                    pid=proc.pid,
+                    pending_requests=len(pending_requests),
+                    pending_asks=len(pending_asks),
+                )
+                deadline = time.monotonic() + timeout_s
+                continue
+
+            elapsed = time.monotonic() - reader_done_at
+            # Tier 3: limbo detection — a one-shot warning surfacing the
+            # condition for triage. ``untether-issue-watcher`` files this
+            # automatically on the next sweep.
+            if (
+                not limbo_logged
+                and elapsed >= self._subcountdown_limbo_detect_threshold_s
+            ):
+                limbo_logged = True
+                diag = collect_proc_diag(proc.pid)
+                run_logger.warning(
+                    "runner.limbo_detected",
+                    engine="claude",
+                    pid=proc.pid,
+                    session_id=sid,
+                    seconds_since_reader_done=round(elapsed, 1),
+                    seconds_since_last_result=(
+                        round(time.monotonic() - state.result_received_at, 1)
+                        if state.result_received_at is not None
+                        else None
+                    ),
+                    mcp_child_pids=list(diag.child_pids) if diag else [],
+                    rss_kb=diag.rss_kb if diag else None,
+                    tcp_total=diag.tcp_total if diag else None,
+                )
+                if stream is not None:
+                    self._transition_lifecycle(
+                        stream,
+                        "limbo",
+                        run_logger,
+                        pid=proc.pid,
+                        session_id=sid,
+                        seconds_since_reader_done=round(elapsed, 1),
+                    )
+
+            if time.monotonic() >= deadline:
+                # Timeout: SIGTERM the process group (start_new_session=True
+                # so PID == pgid). 5 s grace, then SIGKILL.
+                run_logger.warning(
+                    "claude.post_result_idle.sigterm_after_timeout",
+                    session_id=sid,
+                    pid=proc.pid,
+                    timeout_s=timeout_s,
+                    elapsed_s=round(elapsed, 1),
+                )
+                if stream is not None:
+                    self._transition_lifecycle(
+                        stream,
+                        "sigterm_sent",
+                        run_logger,
+                        pid=proc.pid,
+                        session_id=sid,
+                    )
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    _os.killpg(proc.pid, signal.SIGTERM)
+                # Give MCP children configured grace to clean up.
+                grace_deadline = time.monotonic() + self._subcountdown_sigterm_grace_s
+                while time.monotonic() < grace_deadline:
+                    await anyio.sleep(self._subcountdown_sigterm_grace_poll_s)
+                    if proc.returncode is not None:
+                        if stream is not None:
+                            self._transition_lifecycle(
+                                stream,
+                                "exited",
+                                run_logger,
+                                pid=proc.pid,
+                                session_id=sid,
+                                rc=proc.returncode,
+                            )
+                        return "reader_done_but_alive_timeout"
+                # Still alive — SIGKILL the group.
+                run_logger.warning(
+                    "claude.post_result_idle.sigkill_after_grace",
+                    session_id=sid,
+                    pid=proc.pid,
+                )
+                if stream is not None:
+                    self._transition_lifecycle(
+                        stream,
+                        "sigkill_sent",
+                        run_logger,
+                        pid=proc.pid,
+                        session_id=sid,
+                    )
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    _os.killpg(proc.pid, signal.SIGKILL)
+                return "reader_done_but_alive_timeout"
+
     def translate(
         self,
         data: claude_schema.StreamJsonMessage,
@@ -2089,12 +3280,33 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         if env is not None:
             cmd = wrap_with_env_i(cmd, env)
             env = None
+        # #205 / #478: redact two flavours of secret material before logging
+        # ``args`` at INFO:
+        #   1. ``env -i KEY=VAL`` pairs from wrap_with_env_i embed live
+        #      credentials (bot tokens, API keys, BWS access token, ...)
+        #      — handled by ``redact_env_i_args`` (#361).
+        #   2. In legacy mode ``build_args`` ends with ``-- <prompt>`` so the
+        #      whole prompt sits as the last argv element. Truncate at the
+        #      ``--`` boundary so prompt content never reaches INFO logs.
+        logged_args = redact_env_i_args(cmd)[1:]
+        if "--" in logged_args:
+            sep = logged_args.index("--")
+            logged_args = [*logged_args[:sep], "--", "<prompt redacted>"]
         run_logger.info(
             "runner.start",
             engine=self.engine,
             resume=resume.value if resume else None,
-            prompt=prompt[:100] + "…" if len(prompt) > 100 else prompt,
             prompt_len=len(prompt),
+            args=logged_args,
+        )
+        # #205 / #478: prompt content may carry credentials/PII; keep at DEBUG
+        # so it only surfaces with explicit operator opt-in. Mirrors the
+        # base ``runner.run_impl`` companion log so behaviour is consistent
+        # across all engines.
+        run_logger.debug(
+            "runner.start_prompt",
+            engine=self.engine,
+            prompt_preview=prompt[:100] + "…" if len(prompt) > 100 else prompt,
         )
 
         cwd = get_run_base_dir()
@@ -2193,6 +3405,26 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                 self.current_stream = stream
                 reader_done = anyio.Event()
 
+                # #333: load post-result idle settings before the task group
+                # so the watchdog gets a snapshot. A load failure leaves the
+                # legacy "stay alive forever" behaviour in place.
+                post_result_idle_enabled = True
+                post_result_idle_timeout_s = 600.0
+                try:
+                    result = load_settings_if_exists()
+                    if result is not None:
+                        settings_obj, _ = result
+                        post_result_idle_enabled = (
+                            settings_obj.watchdog.post_result_idle_enabled
+                        )
+                        post_result_idle_timeout_s = float(
+                            settings_obj.watchdog.post_result_idle_timeout
+                        )
+                except Exception:  # noqa: BLE001 — settings errors must not block a run
+                    run_logger.debug(
+                        "post_result_idle.settings_load_failed", exc_info=True
+                    )
+
                 async with anyio.create_task_group() as tg:
                     tg.start_soon(
                         drain_stderr,
@@ -2209,6 +3441,21 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                         run_logger,
                         proc.pid,
                     )
+                    if (
+                        use_control_channel
+                        and this_proc_stdin is not None
+                        and post_result_idle_enabled
+                    ):
+                        tg.start_soon(
+                            self._post_result_idle_watchdog,
+                            state,
+                            this_proc_stdin,
+                            reader_done,
+                            run_logger,
+                            post_result_idle_timeout_s,
+                            proc,
+                            stream,
+                        )
                     async for evt in self._iter_jsonl_events(
                         stdout=proc.stdout,
                         stream=stream,
@@ -2227,6 +3474,13 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
                     if use_control_channel and this_proc_stdin is not None:
                         with contextlib.suppress(Exception):
                             await this_proc_stdin.aclose()
+                    # #502 — Close our read end of stderr so drain_stderr
+                    # exits even when a child (e.g. an MCP server) inherited
+                    # the stderr fd and is keeping it open. Without this the
+                    # task group blocks forever waiting on drain_stderr and
+                    # `proc.wait()` below is never reached.
+                    with contextlib.suppress(Exception):
+                        await proc.stderr.aclose()
 
                 rc = await proc.wait()
                 run_logger.info("subprocess.exit", pid=proc.pid, rc=rc)
@@ -2309,7 +3563,7 @@ class ClaudeRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             self._pty_master_fd = None
 
 
-def build_runner(config: EngineConfig, _config_path: Path) -> Runner:
+def build_runner(config: EngineConfig, config_path: Path) -> Runner:
     claude_cmd = shutil.which("claude") or "claude"
 
     model = config.get("model")
@@ -2322,11 +3576,41 @@ def build_runner(config: EngineConfig, _config_path: Path) -> Runner:
     permission_mode = config.get("permission_mode")
     title = str(model) if model is not None else "claude"
 
+    extra_args_value = config.get("extra_args")
+    if extra_args_value is None:
+        extra_args: list[str] = []
+    elif isinstance(extra_args_value, list) and all(
+        isinstance(item, str) for item in extra_args_value
+    ):
+        extra_args = list(extra_args_value)
+    else:
+        logger.warning(
+            "claude.config.invalid",
+            error="extra_args must be a list of strings",
+            config_path=str(config_path),
+        )
+        raise ConfigError(
+            f"Invalid `claude.extra_args` in {config_path}; expected a list of strings."
+        )
+
+    reserved_flag = _find_reserved_flag(extra_args)
+    if reserved_flag:
+        logger.warning(
+            "claude.config.invalid",
+            error=f"reserved flag {reserved_flag!r} is managed by Untether",
+            config_path=str(config_path),
+        )
+        raise ConfigError(
+            f"Invalid `claude.extra_args` in {config_path}; flag {reserved_flag!r} "
+            f"is managed by Untether and cannot be overridden."
+        )
+
     return ClaudeRunner(
         claude_cmd=claude_cmd,
         model=model,
         permission_mode=permission_mode,
         allowed_tools=allowed_tools,
+        extra_args=extra_args,
         dangerously_skip_permissions=dangerously_skip_permissions,
         use_api_billing=use_api_billing,
         session_title=title,

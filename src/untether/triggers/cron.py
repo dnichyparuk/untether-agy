@@ -98,6 +98,12 @@ async def run_cron_scheduler(
 
     while True:
         utc_now = datetime.datetime.now(datetime.UTC)
+        # #294: master pause flag — skip every cron's tick when set.
+        # `run_once` crons that would have fired during the pause are NOT
+        # consumed; they fire on the next matching tick after resume.
+        if manager.is_paused:
+            await anyio.sleep(60 - utc_now.second + 0.1)
+            continue
         # Snapshot the cron list for this tick — safe even if update()
         # replaces manager._crons mid-iteration (new list, old ref valid).
         crons = manager.crons
@@ -122,6 +128,14 @@ async def run_cron_scheduler(
                 last_fired[cron.id] = key
                 logger.info("triggers.cron.firing", cron_id=cron.id)
                 await dispatcher.dispatch_cron(cron)
+                # #271 Tier 3: record last-fired-at after dispatch returns.
+                # `dispatch_cron` only blocks until the notification is
+                # queued, not run completion — recording here means the
+                # `/config:tg` page reflects every dispatched cron, even if
+                # the run later fails.
+                from . import history
+
+                history.record_fired(cron.id)
                 # #288: one-shot crons are removed from the active list
                 # after firing; they stay in the TOML and re-activate on
                 # the next config reload or restart.

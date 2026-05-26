@@ -483,7 +483,7 @@ class _KeyboardPresenter:
     def set_no_approval(self) -> None:
         self.keyboard = [[{"text": "Cancel"}]]
 
-    def render_progress(self, state, *, elapsed_s, label="working"):
+    def render_progress(self, state, *, elapsed_s, label="working", now=None):
         return RenderedMessage(
             text=f"{label} {elapsed_s:.0f}s",
             extra={"reply_markup": {"inline_keyboard": self.keyboard}},
@@ -500,7 +500,10 @@ def _make_edits(
 ) -> ProgressEdits:
     if clock is None:
         clock = _FakeClock()
-    tracker = ProgressTracker(engine="codex")
+    # #481: thread the FakeClock into the tracker so ActionState
+    # timestamps align with the bridge's clock (otherwise long-running
+    # action age computations would mix wall-clock and fake clock).
+    tracker = ProgressTracker(engine="codex", clock=clock)
     progress_ref = MessageRef(channel_id=123, message_id=1)
     return ProgressEdits(
         transport=transport,
@@ -818,12 +821,15 @@ class TestMaybeAppendUsageFooterAlwaysShow:
         from untether.utils import usage_cache
 
         usage_cache.reset_cache()
-        # Also reset the schema-warning latch so tests can exercise it more than once.
+        # Reset the schema-mismatch counter (#410: per-call counter
+        # replaces the old one-shot latch).
         import untether.runner_bridge as rb
 
+        rb._USAGE_SCHEMA_MISMATCH_COUNT = 0
         rb._USAGE_SCHEMA_WARNED = False
         yield
         usage_cache.reset_cache()
+        rb._USAGE_SCHEMA_MISMATCH_COUNT = 0
         rb._USAGE_SCHEMA_WARNED = False
 
     @pytest.mark.anyio
@@ -853,8 +859,9 @@ class TestMaybeAppendUsageFooterAlwaysShow:
         assert "\u26a1" in result.text
 
     @pytest.mark.anyio
-    async def test_schema_mismatch_warning_fires_once(self, monkeypatch):
-        """Missing expected fields in the usage payload log a one-shot warning."""
+    async def test_schema_mismatch_warning_fires_every_call(self, monkeypatch):
+        """#410: schema_mismatch promotes from one-shot to per-call counter so
+        the issue-watcher fires for ongoing drift, not just the first hit."""
         from untether import runner_bridge as rb
 
         async def _fake_fetch():
@@ -875,13 +882,27 @@ class TestMaybeAppendUsageFooterAlwaysShow:
 
         monkeypatch.setattr(rb.logger, "warning", _warn)
 
-        msg = RenderedMessage(text="Done.", extra={})
-        await rb._maybe_append_usage_footer(msg, always_show=True)
-        await rb._maybe_append_usage_footer(msg, always_show=True)
+        # Call _validate_usage_schema directly to exercise per-call behaviour
+        # (the cached fetcher path memoises within the TTL window).
+        rb._validate_usage_schema(
+            {"five_hour": {"utilization": 25.0}, "seven_day": {"utilization": 10.0}}
+        )
+        rb._validate_usage_schema(
+            {"five_hour": {"utilization": 25.0}, "seven_day": {"utilization": 10.0}}
+        )
+        rb._validate_usage_schema(
+            {"five_hour": {"utilization": 25.0}, "seven_day": {"utilization": 10.0}}
+        )
 
         mismatch = [c for c in warn_calls if c[0] == "claude_usage.schema_mismatch"]
-        assert len(mismatch) == 1  # fires exactly once
+        assert len(mismatch) == 3  # one per call now, not one per process
         assert mismatch[0][1]["missing"]  # has a non-empty list
+        # #410: structured log carries a cumulative count field.
+        assert mismatch[0][1]["count"] == 1
+        assert mismatch[1][1]["count"] == 2
+        assert mismatch[2][1]["count"] == 3
+        # Public accessor reports the same count.
+        assert rb.get_usage_schema_mismatch_count() == 3
 
     @pytest.mark.anyio
     async def test_always_show_false_hides_below_threshold(self, monkeypatch):
@@ -2356,13 +2377,22 @@ async def test_stall_suppressed_while_waiting_for_approval() -> None:
 
 @pytest.mark.anyio
 async def test_stall_fires_after_approval_threshold() -> None:
-    """Stall monitor fires after the longer approval threshold is exceeded."""
+    """Stall monitor fires after the longer approval threshold is exceeded.
+
+    #494-C: the message must say "Awaiting your approval" rather than the
+    generic "No progress" copy, so the user realises the buttons above are
+    theirs to action and the agent has not hung.
+    """
     transport = FakeTransport()
     presenter = _KeyboardPresenter()
     clock = _FakeClock(start=100.0)
     edits = _make_edits(transport, presenter, clock=clock)
     edits._stall_check_interval = 0.01
     edits._STALL_THRESHOLD_SECONDS = 0.05
+    # #526 rc20 follow-up: approval-pending now uses a two-tier threshold
+    # (FIRST then refire). Override both so the test still exercises the
+    # first-reminder path.
+    edits._STALL_THRESHOLD_APPROVAL_FIRST = 0.1
     edits._STALL_THRESHOLD_APPROVAL = 0.1  # short for test
 
     from untether.model import Action, ActionEvent
@@ -2392,8 +2422,203 @@ async def test_stall_fires_after_approval_threshold() -> None:
         tg.start_soon(drive)
 
     assert edits._stall_warn_count >= 1
-    stall_msgs = [c for c in transport.send_calls if "No progress" in c["message"].text]
-    assert len(stall_msgs) >= 1
+    # #494-C: message text differentiates from the generic stall copy
+    approval_msgs = [
+        c for c in transport.send_calls if "Awaiting your approval" in c["message"].text
+    ]
+    assert len(approval_msgs) >= 1, (
+        f"Expected at least one 'Awaiting your approval' message, got: "
+        f"{[c['message'].text for c in transport.send_calls]}"
+    )
+    # And it must NOT contain the generic "No progress" copy or the
+    # alarming "session may be stuck" suffix.
+    assert "No progress" not in approval_msgs[0]["message"].text
+    assert "session may be stuck" not in approval_msgs[0]["message"].text
+
+
+@pytest.mark.anyio
+async def test_stall_approval_pending_demotes_warn_to_info(monkeypatch) -> None:
+    """#526: when threshold_reason == 'pending_approval', the WARN
+    ``progress_edits.stall_detected`` is replaced by an INFO
+    ``subprocess.approval_pending`` event so warn-filter dashboards stop
+    spamming during normal approval flows. The chat-side message is
+    independent (covered by #494-C) and continues to fire.
+    """
+    from structlog.testing import capture_logs
+
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    # #526 rc20 follow-up: two-tier approval threshold (FIRST + refire).
+    edits._STALL_THRESHOLD_APPROVAL_FIRST = 0.1
+    edits._STALL_THRESHOLD_APPROVAL = 0.1
+
+    from untether.model import Action, ActionEvent
+
+    evt = ActionEvent(
+        engine="claude",
+        action=Action(
+            id="ctrl.1",
+            kind="warning",
+            title="Permission Request [CanUseTool] - tool: ExitPlanMode",
+            detail={"inline_keyboard": {"buttons": [[{"text": "Approve"}]]}},
+        ),
+        phase="started",
+    )
+    await edits.on_event(evt)
+    clock.set(100.0)
+
+    with capture_logs() as logs:
+        async with anyio.create_task_group() as tg:
+
+            async def drive() -> None:
+                clock.set(100.2)
+                await anyio.sleep(0.05)
+                edits.signal_send.close()
+
+            tg.start_soon(edits.run)
+            tg.start_soon(drive)
+
+    # The WARN must NOT have been emitted.
+    stall_warns = [e for e in logs if e.get("event") == "progress_edits.stall_detected"]
+    assert stall_warns == [], (
+        f"approval-pending must not emit progress_edits.stall_detected WARN, got: "
+        f"{stall_warns}"
+    )
+
+    # The INFO replacement MUST have been emitted.
+    approval_infos = [
+        e for e in logs if e.get("event") == "subprocess.approval_pending"
+    ]
+    assert len(approval_infos) >= 1
+    assert approval_infos[0].get("approval_pending") is True
+    assert approval_infos[0].get("log_level") == "info"
+
+
+@pytest.mark.anyio
+async def test_stall_approval_pending_info_event_paced_to_30_min(
+    monkeypatch,
+) -> None:
+    """#526: even on rapid stall ticks (every minute or so), the
+    ``subprocess.approval_pending`` INFO fires at most once per 30
+    minutes. The first tick emits; subsequent ticks within the window
+    are silent.
+    """
+    from structlog.testing import capture_logs
+
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    # #526 rc20 follow-up: two-tier approval threshold (FIRST + refire).
+    edits._STALL_THRESHOLD_APPROVAL_FIRST = 0.05
+    edits._STALL_THRESHOLD_APPROVAL = 0.05
+    edits._stall_repeat_seconds = 0.0  # bypass the per-tick repeat guard
+
+    from untether.model import Action, ActionEvent
+
+    evt = ActionEvent(
+        engine="claude",
+        action=Action(
+            id="ctrl.1",
+            kind="warning",
+            title="Permission Request [CanUseTool] - tool: AskUserQuestion",
+            detail={"inline_keyboard": {"buttons": [[{"text": "Approve"}]]}},
+        ),
+        phase="started",
+    )
+    await edits.on_event(evt)
+    clock.set(100.0)
+
+    with capture_logs() as logs:
+        async with anyio.create_task_group() as tg:
+
+            async def drive() -> None:
+                # Advance the wall clock past threshold for 2-3 ticks
+                # (well within the 30-min approval-pending window) and
+                # confirm the INFO fires only once.
+                clock.set(100.2)
+                await anyio.sleep(0.03)
+                clock.set(100.5)
+                await anyio.sleep(0.03)
+                clock.set(100.8)
+                await anyio.sleep(0.03)
+                edits.signal_send.close()
+
+            tg.start_soon(edits.run)
+            tg.start_soon(drive)
+
+    approval_infos = [
+        e for e in logs if e.get("event") == "subprocess.approval_pending"
+    ]
+    assert len(approval_infos) == 1, (
+        f"Expected exactly 1 approval-pending INFO within 30-min window, got: "
+        f"{len(approval_infos)} ({approval_infos})"
+    )
+
+
+@pytest.mark.anyio
+async def test_first_approval_reminder_uses_lower_threshold() -> None:
+    """#526 rc20 follow-up: the FIRST chat-side reminder for an
+    approval-pending session fires at ``_STALL_THRESHOLD_APPROVAL_FIRST``
+    (default 600 s — same as the tool stall) rather than the 1800 s
+    refire threshold. Without this fix, nsd evidence (2026-05-18)
+    showed users cancelling productive sessions after ~13 min of
+    silence because no chat-side reassurance had been emitted yet.
+    Subsequent reminders fall back to the 1800 s refire threshold.
+    """
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 100.0  # normal: very long, shouldn't match
+    edits._STALL_THRESHOLD_APPROVAL_FIRST = 0.1  # first: short
+    edits._STALL_THRESHOLD_APPROVAL = 100.0  # refire: very long
+
+    from untether.model import Action, ActionEvent
+
+    evt = ActionEvent(
+        engine="claude",
+        action=Action(
+            id="ctrl.1",
+            kind="warning",
+            title="Permission Request [CanUseTool] - tool: ExitPlanMode",
+            detail={"inline_keyboard": {"buttons": [[{"text": "Approve"}]]}},
+        ),
+        phase="started",
+    )
+    await edits.on_event(evt)
+    clock.set(100.0)
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            clock.set(100.2)  # past FIRST (0.1) but not refire (100)
+            await anyio.sleep(0.05)
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    # The chat-side reminder fired with the reworded copy quoted from
+    # the audit's recommended text (covers the "tap a button above"
+    # affordance + the "no action needed otherwise" reassurance).
+    approval_msgs = [
+        c for c in transport.send_calls if "Awaiting your approval" in c["message"].text
+    ]
+    assert len(approval_msgs) >= 1, (
+        f"Expected reworded approval reminder, saw: "
+        f"{[c['message'].text[:80] for c in transport.send_calls]}"
+    )
+    msg_text = approval_msgs[0]["message"].text
+    assert "tap a button above" in msg_text
+    assert "no action needed" in msg_text
 
 
 @pytest.mark.anyio
@@ -4587,6 +4812,129 @@ async def test_outbox_not_scanned_on_error(tmp_path) -> None:
     send_file.assert_not_called()
 
 
+@pytest.mark.anyio
+async def test_outbox_skipped_surfaced_on_failed_run(tmp_path) -> None:
+    """#524 rc20 follow-up: when a run fails (run_ok=False) but the outbox
+    contains a directory or other blocked entry, the user should still get
+    the ``📎 Outbox skipped`` follow-up message. Without this fix, failed
+    runs silently lose all evidence of intended deliveries."""
+    from unittest.mock import AsyncMock
+
+    from untether.settings import TelegramFilesSettings
+    from untether.utils.paths import reset_run_base_dir, set_run_base_dir
+
+    outbox = tmp_path / ".untether-outbox"
+    outbox.mkdir()
+    # Directory entry — always "skipped" by scan_outbox
+    (outbox / "guides").mkdir()
+
+    send_file = AsyncMock()
+    files_cfg = TelegramFilesSettings(enabled=True)
+    transport = FakeTransport()
+    runner = ScriptRunner([ErrorReturn(error="failed")], engine=CODEX_ENGINE)
+    cfg = ExecBridgeConfig(
+        transport=transport,
+        presenter=MarkdownPresenter(),
+        final_notify=False,
+        send_file=send_file,
+        outbox_config=files_cfg,
+    )
+    incoming = IncomingMessage(channel_id=1, message_id=1, text="test")
+    token = set_run_base_dir(tmp_path)
+    try:
+        await handle_message(cfg, runner=runner, incoming=incoming, resume_token=None)
+    finally:
+        reset_run_base_dir(token)
+
+    # No actual file delivery on a failed run.
+    send_file.assert_not_called()
+    # But the skipped notice IS sent — the user learns that ``guides/`` was
+    # left behind.
+    skipped_notices = [
+        c
+        for c in transport.send_calls
+        if "Outbox skipped" in c["message"].text and "guides" in c["message"].text
+    ]
+    assert len(skipped_notices) == 1, (
+        f"Expected exactly one Outbox skipped notice on failed run, "
+        f"saw {len(skipped_notices)}: "
+        f"{[c['message'].text[:80] for c in transport.send_calls]}"
+    )
+
+
+@pytest.mark.anyio
+async def test_outbox_skipped_surfaced_when_notify_disabled_stays_silent(
+    tmp_path,
+) -> None:
+    """The ``outbox_notify_skipped`` config flag opts the user out of
+    skipped-item surfacing entirely — verify it suppresses the failed-run
+    path too (not just the normal-completion path tested in rc19)."""
+    from unittest.mock import AsyncMock
+
+    from untether.settings import TelegramFilesSettings
+    from untether.utils.paths import reset_run_base_dir, set_run_base_dir
+
+    outbox = tmp_path / ".untether-outbox"
+    outbox.mkdir()
+    (outbox / "guides").mkdir()
+
+    send_file = AsyncMock()
+    files_cfg = TelegramFilesSettings(enabled=True, outbox_notify_skipped=False)
+    transport = FakeTransport()
+    runner = ScriptRunner([ErrorReturn(error="failed")], engine=CODEX_ENGINE)
+    cfg = ExecBridgeConfig(
+        transport=transport,
+        presenter=MarkdownPresenter(),
+        final_notify=False,
+        send_file=send_file,
+        outbox_config=files_cfg,
+    )
+    incoming = IncomingMessage(channel_id=1, message_id=1, text="test")
+    token = set_run_base_dir(tmp_path)
+    try:
+        await handle_message(cfg, runner=runner, incoming=incoming, resume_token=None)
+    finally:
+        reset_run_base_dir(token)
+
+    skipped_notices = [
+        c for c in transport.send_calls if "Outbox skipped" in c["message"].text
+    ]
+    assert skipped_notices == []
+
+
+@pytest.mark.anyio
+async def test_surface_outbox_skipped_helper_only_overflow_entries_silent(
+    tmp_path,
+) -> None:
+    """#524 rc20 follow-up: the ``...`` pseudo-entry from max_files
+    overflow is filtered out of the user-facing notice. If the only
+    skipped item is the overflow rollup, no message is sent at all."""
+    from untether.runner_bridge import _surface_outbox_skipped
+    from untether.settings import TelegramFilesSettings
+    from untether.transport import MessageRef
+
+    files_cfg = TelegramFilesSettings(enabled=True)
+    transport = FakeTransport()
+    cfg = ExecBridgeConfig(
+        transport=transport,
+        presenter=MarkdownPresenter(),
+        final_notify=False,
+        outbox_config=files_cfg,
+    )
+    incoming = IncomingMessage(channel_id=1, message_id=1, text="test")
+    user_ref = MessageRef(channel_id=1, message_id=1)
+
+    await _surface_outbox_skipped(
+        cfg,
+        incoming,
+        user_ref,
+        [("...", "3 more files exceeded max_files=10")],
+        files_cfg,
+    )
+
+    assert transport.send_calls == []
+
+
 # ── _should_auto_continue detection (#34142/#30333) ──
 
 
@@ -5078,3 +5426,729 @@ class TestHandleStuckAfterToolResult:
         )
         await edits.on_event(evt)
         assert edits._stuck_state is None
+
+
+# ---------------------------------------------------------------------------
+# #470 + #481: expected-wait suppression matrix + post-result closing message.
+# ---------------------------------------------------------------------------
+
+
+def _make_engine_state(**fields):
+    """Build a SimpleNamespace mocking ClaudeStreamState for stall tests.
+
+    The bridge's expected-wait helpers (``_is_post_result_idle``,
+    ``_has_pending_wakeup``, ``_has_active_monitor``) duck-type against
+    ``stream.engine_state`` so a SimpleNamespace with the right attrs is
+    sufficient.
+    """
+    from types import SimpleNamespace
+
+    defaults: dict = {
+        "result_received_at": None,
+        "live_wakeups": {},
+        "live_monitors": {},
+        "live_bg_bashes": set(),
+        "live_bg_agents": set(),
+        "live_remote_triggers": set(),
+        "post_result_closed_at": None,
+        "post_result_idle_minutes": 0.0,
+        "post_result_closing_sent": False,
+    }
+    defaults.update(fields)
+    return SimpleNamespace(**defaults)
+
+
+def _make_stream(*, last_event_type="user", engine_state=None):
+    """Mock JsonlStreamState for stall tests."""
+    from collections import deque
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        recent_events=deque([(1.0, "system"), (2.0, "assistant")], maxlen=10),
+        last_event_type=last_event_type,
+        stderr_capture=[],
+        engine_state=engine_state,
+    )
+
+
+@pytest.mark.anyio
+async def test_stall_post_result_suppressed_when_result_armed() -> None:
+    """#470: stream.last_event_type == 'result' suppresses Telegram notification."""
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    edits._STALL_THRESHOLD_TOOL = 0.05
+    edits._STALL_THRESHOLD_APPROVAL = 10.0
+    # Long repeat seconds so only 1 stall tick fires within the test window —
+    # otherwise the unchanging fake recent_events deque escalates frozen-ring
+    # past the 3-tick threshold and overrides these suppressions (which is
+    # the spec — see test_stall_post_result_overridden_by_frozen_ring).
+    edits._stall_repeat_seconds = 1000.0
+
+    edits.stream = _make_stream(
+        last_event_type="result",
+        engine_state=_make_engine_state(result_received_at=99.0),
+    )
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            clock.set(110.0)
+            await anyio.sleep(0.15)
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    # No Telegram stall warning sent (post-result suppression).
+    stall_msgs = [c for c in transport.send_calls if "min" in c["message"].text]
+    assert stall_msgs == []
+
+
+@pytest.mark.anyio
+async def test_stall_post_result_blocks_auto_cancel() -> None:
+    """#470: post-result idle blocks the max_warnings auto-cancel arm."""
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    edits._STALL_THRESHOLD_TOOL = 0.05
+    edits._STALL_THRESHOLD_APPROVAL = 10.0
+    # Long repeat seconds so only 1 stall tick fires within the test window —
+    # otherwise the unchanging fake recent_events deque escalates frozen-ring
+    # past the 3-tick threshold and overrides these suppressions (which is
+    # the spec — see test_stall_post_result_overridden_by_frozen_ring).
+    edits._stall_repeat_seconds = 1000.0
+    edits._STALL_MAX_WARNINGS = 2  # easy to cross
+    cancel_event = anyio.Event()
+    edits.cancel_event = cancel_event
+
+    edits.stream = _make_stream(
+        last_event_type="result",
+        engine_state=_make_engine_state(result_received_at=99.0),
+    )
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            clock.set(110.0)
+            await anyio.sleep(0.2)
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    assert not cancel_event.is_set()
+
+
+@pytest.mark.anyio
+async def test_stall_post_result_overridden_by_frozen_ring() -> None:
+    """#470: genuinely-frozen post-result session still warns (frozen-ring wins)."""
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    edits._STALL_THRESHOLD_TOOL = 0.05
+    edits._STALL_THRESHOLD_APPROVAL = 10.0
+    # Long repeat seconds so only 1 stall tick fires within the test window —
+    # otherwise the unchanging fake recent_events deque escalates frozen-ring
+    # past the 3-tick threshold and overrides these suppressions (which is
+    # the spec — see test_stall_post_result_overridden_by_frozen_ring).
+    edits._stall_repeat_seconds = 1000.0
+    # Pre-arm frozen-ring count AND prev_recent_events so the first stall
+    # tick increments (instead of resetting to 0) and frozen_escalate
+    # fires immediately. The deque content is set by _make_stream() —
+    # match the rounded snapshot the bridge will compute.
+    edits._frozen_ring_count = 4  # 4 + 1 (this tick) = 5, past threshold
+    edits._prev_recent_events = [(1.0, "system"), (2.0, "assistant")]
+
+    edits.stream = _make_stream(
+        last_event_type="result",
+        engine_state=_make_engine_state(result_received_at=99.0),
+    )
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            clock.set(110.0)
+            await anyio.sleep(0.15)
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    # Frozen-ring escalation overrides post-result suppression.
+    stall_msgs = [c for c in transport.send_calls if "No progress" in c["message"].text]
+    assert len(stall_msgs) >= 1
+
+
+@pytest.mark.anyio
+async def test_stall_schedule_wakeup_suppressed_when_deadline_future() -> None:
+    """#481: ScheduleWakeup with future deadline suppresses warning."""
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    edits._STALL_THRESHOLD_TOOL = 0.05
+    edits._STALL_THRESHOLD_APPROVAL = 10.0
+    # Long repeat seconds so only 1 stall tick fires within the test window —
+    # otherwise the unchanging fake recent_events deque escalates frozen-ring
+    # past the 3-tick threshold and overrides these suppressions (which is
+    # the spec — see test_stall_post_result_overridden_by_frozen_ring).
+    edits._stall_repeat_seconds = 1000.0
+
+    # Deadline 1000s in the future (well beyond the test clock advance).
+    import time as _t
+
+    edits.stream = _make_stream(
+        engine_state=_make_engine_state(
+            live_wakeups={"toolu_1": _t.monotonic() + 1000.0}
+        )
+    )
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            clock.set(110.0)
+            await anyio.sleep(0.15)
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    stall_msgs = [c for c in transport.send_calls if "min" in c["message"].text]
+    assert stall_msgs == []
+
+
+@pytest.mark.anyio
+async def test_stall_schedule_wakeup_overridden_by_frozen_ring() -> None:
+    """#481: genuinely-frozen ScheduleWakeup session still warns."""
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    edits._STALL_THRESHOLD_TOOL = 0.05
+    edits._STALL_THRESHOLD_APPROVAL = 10.0
+    # Long repeat seconds so only 1 stall tick fires within the test window —
+    # otherwise the unchanging fake recent_events deque escalates frozen-ring
+    # past the 3-tick threshold and overrides these suppressions (which is
+    # the spec — see test_stall_post_result_overridden_by_frozen_ring).
+    edits._stall_repeat_seconds = 1000.0
+    edits._frozen_ring_count = 4
+    edits._prev_recent_events = [(1.0, "system"), (2.0, "assistant")]
+
+    import time as _t
+
+    edits.stream = _make_stream(
+        engine_state=_make_engine_state(
+            live_wakeups={"toolu_1": _t.monotonic() + 1000.0}
+        )
+    )
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            clock.set(110.0)
+            await anyio.sleep(0.15)
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    stall_msgs = [c for c in transport.send_calls if "No progress" in c["message"].text]
+    assert len(stall_msgs) >= 1
+
+
+@pytest.mark.anyio
+async def test_stall_bash_grace_suppressed_within_window() -> None:
+    """#481: recent Bash within bash_grace_seconds suppresses warning."""
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    edits._STALL_THRESHOLD_TOOL = 0.05
+    edits._STALL_THRESHOLD_APPROVAL = 10.0
+    # Long repeat seconds so only 1 stall tick fires within the test window —
+    # otherwise the unchanging fake recent_events deque escalates frozen-ring
+    # past the 3-tick threshold and overrides these suppressions (which is
+    # the spec — see test_stall_post_result_overridden_by_frozen_ring).
+    edits._stall_repeat_seconds = 1000.0
+    # Long grace window — covers the entire test.
+    edits._bash_grace_seconds = 10.0
+
+    edits.stream = _make_stream()
+
+    from untether.model import Action, ActionEvent
+
+    evt = ActionEvent(
+        engine="claude",
+        action=Action(
+            id="a1",
+            kind="command",
+            title="ls -la",
+            detail={"name": "Bash", "input": {"command": "ls -la"}},
+        ),
+        phase="started",
+    )
+    await edits.on_event(evt)
+    clock.set(101.0)  # 1s after action start — well within 10s grace
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            clock.set(101.5)  # past stall threshold but within bash grace
+            await anyio.sleep(0.15)
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    stall_msgs = [c for c in transport.send_calls if "min" in c["message"].text]
+    assert stall_msgs == []
+
+
+@pytest.mark.anyio
+async def test_stall_bash_fresh_output_suppressed() -> None:
+    """#481: BashOutput within stall_threshold/2 suppresses warning."""
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 10.0  # threshold/2 = 5.0
+    edits._STALL_THRESHOLD_TOOL = 10.0
+    edits._STALL_THRESHOLD_APPROVAL = 100.0
+    edits._stall_repeat_seconds = 1000.0
+    edits._bash_grace_seconds = 0.1  # disable grace; only fresh-output gates
+
+    edits.stream = _make_stream()
+
+    from untether.model import Action, ActionEvent
+
+    # Drive clock to 110, then fire BashOutput so its last_update_at = 110.
+    # At stall check (clock=113), 113-110=3 s is within the 5 s freshness
+    # window; 113-100=13 s is past the 10 s stall threshold.
+    clock.set(110.0)
+    evt = ActionEvent(
+        engine="claude",
+        action=Action(
+            id="a1",
+            kind="tool",
+            title="BashOutput",
+            detail={"name": "BashOutput", "input": {"bash_id": "shell_x"}},
+        ),
+        phase="completed",
+        ok=True,
+    )
+    await edits.on_event(evt)
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            clock.set(113.0)
+            await anyio.sleep(0.05)
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    stall_msgs = [c for c in transport.send_calls if "min" in c["message"].text]
+    assert stall_msgs == []
+
+
+@pytest.mark.anyio
+async def test_stall_monitor_active_suppressed() -> None:
+    """#481: active Monitor with future deadline suppresses warning."""
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    edits._STALL_THRESHOLD_TOOL = 0.05
+    edits._STALL_THRESHOLD_APPROVAL = 10.0
+    # Long repeat seconds so only 1 stall tick fires within the test window —
+    # otherwise the unchanging fake recent_events deque escalates frozen-ring
+    # past the 3-tick threshold and overrides these suppressions (which is
+    # the spec — see test_stall_post_result_overridden_by_frozen_ring).
+    edits._stall_repeat_seconds = 1000.0
+
+    import time as _t
+
+    edits.stream = _make_stream(
+        engine_state=_make_engine_state(
+            live_monitors={"toolu_m1": _t.monotonic() + 1000.0}
+        )
+    )
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            clock.set(110.0)
+            await anyio.sleep(0.15)
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    stall_msgs = [c for c in transport.send_calls if "min" in c["message"].text]
+    assert stall_msgs == []
+
+
+@pytest.mark.anyio
+async def test_post_result_closing_message_sent() -> None:
+    """#470: closing message fires when post_result_closed_at is stamped."""
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 100.0  # never stall during test
+    edits._STALL_THRESHOLD_TOOL = 100.0
+    edits._STALL_THRESHOLD_APPROVAL = 100.0
+
+    import time as _t
+
+    es = _make_engine_state(
+        post_result_closed_at=_t.monotonic(),
+        post_result_idle_minutes=10.0,
+        post_result_closing_sent=False,
+    )
+    edits.stream = _make_stream(engine_state=es)
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            await anyio.sleep(0.05)
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    closing = [
+        c
+        for c in transport.send_calls
+        if "turn complete" in c["message"].text and "10m idle" in c["message"].text
+    ]
+    assert len(closing) == 1
+    assert es.post_result_closing_sent is True
+
+
+@pytest.mark.anyio
+async def test_post_result_closing_message_idempotent() -> None:
+    """#470: closing message fires exactly once even with multiple ticks."""
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 100.0
+    edits._STALL_THRESHOLD_TOOL = 100.0
+    edits._STALL_THRESHOLD_APPROVAL = 100.0
+
+    import time as _t
+
+    es = _make_engine_state(
+        post_result_closed_at=_t.monotonic(),
+        post_result_idle_minutes=12.0,
+        post_result_closing_sent=False,
+    )
+    edits.stream = _make_stream(engine_state=es)
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            await anyio.sleep(0.2)  # many ticks at 0.01s
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    closing = [c for c in transport.send_calls if "turn complete" in c["message"].text]
+    assert len(closing) == 1
+
+
+@pytest.mark.anyio
+async def test_heartbeat_mutates_schedule_wakeup_countdown() -> None:
+    """#481: heartbeat tick injects detail['countdown_s'] for ScheduleWakeup."""
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 100.0  # disable stall path
+    edits._heartbeat_interval = 0.01
+
+    import time as _t
+
+    deadline = _t.monotonic() + 60.0
+    es = _make_engine_state(live_wakeups={"toolu_w1": deadline})
+    edits.stream = _make_stream(engine_state=es)
+
+    from untether.model import Action, ActionEvent
+
+    evt = ActionEvent(
+        engine="claude",
+        action=Action(
+            id="toolu_w1",
+            kind="tool",
+            title="ScheduleWakeup",
+            detail={
+                "name": "ScheduleWakeup",
+                "input": {"delaySeconds": 60, "reason": "build check"},
+            },
+        ),
+        phase="started",
+    )
+    await edits.on_event(evt)
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            await anyio.sleep(0.05)
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    action_state = next(iter(edits.tracker._actions.values()))
+    assert "countdown_s" in action_state.action.detail
+    assert action_state.action.detail["countdown_s"] >= 0
+
+
+# ---------------------------------------------------------------------------
+# #333 Tier 2 — post-result limbo lets auto-cancel fire when watchdog fails
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_333_post_result_limbo_lets_auto_cancel_fire() -> None:
+    """#333 Tier 2: when post-result idle age exceeds the limbo threshold AND
+    no other expected-wait flag is set, the stall detector stops suppressing
+    auto-cancel. Defense-in-depth for the case where claude.py Tier 1
+    subcountdown failed to close the subprocess."""
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=1000.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    edits._STALL_THRESHOLD_TOOL = 0.05
+    edits._STALL_THRESHOLD_APPROVAL = 10.0
+    edits._stall_repeat_seconds = 0.0
+    edits._STALL_MAX_WARNINGS = 1
+    edits._POST_RESULT_LIMBO_THRESHOLD_S = 60.0
+    cancel_event = anyio.Event()
+    edits.cancel_event = cancel_event
+
+    # ``result_received_at`` set 100 s ago (> 60 s limbo threshold).
+    edits.stream = _make_stream(
+        last_event_type="result",
+        engine_state=_make_engine_state(result_received_at=900.0),
+    )
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            clock.set(1010.0)  # 10 s after stall window opens
+            with anyio.move_on_after(1.0):
+                await cancel_event.wait()
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    # Limbo detection logged + auto-cancel fired.
+    assert edits._post_result_limbo_logged is True
+    assert cancel_event.is_set()
+
+
+@pytest.mark.anyio
+async def test_333_post_result_below_limbo_threshold_still_suppresses() -> None:
+    """#333 Tier 2: within the limbo threshold, post-result idle still
+    suppresses auto-cancel (preserves existing behaviour for normal sessions
+    where the watchdog will close stdin shortly)."""
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=1000.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    edits._STALL_THRESHOLD_TOOL = 0.05
+    edits._STALL_THRESHOLD_APPROVAL = 10.0
+    edits._stall_repeat_seconds = 1000.0
+    edits._STALL_MAX_WARNINGS = 2
+    edits._POST_RESULT_LIMBO_THRESHOLD_S = 600.0
+    cancel_event = anyio.Event()
+    edits.cancel_event = cancel_event
+
+    # ``result_received_at`` 10 s ago (< 600 s limbo threshold).
+    edits.stream = _make_stream(
+        last_event_type="result",
+        engine_state=_make_engine_state(result_received_at=990.0),
+    )
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            clock.set(1010.0)
+            await anyio.sleep(0.2)
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    assert edits._post_result_limbo_logged is False
+    assert not cancel_event.is_set()
+
+
+@pytest.mark.anyio
+async def test_333_post_result_with_pending_wakeup_keeps_suppression() -> None:
+    """#333 Tier 2: even when post-result idle age exceeds the limbo
+    threshold, another active expected-wait signal (ScheduleWakeup here)
+    keeps auto-cancel suppressed."""
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=1000.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    edits._STALL_THRESHOLD_TOOL = 0.05
+    edits._STALL_THRESHOLD_APPROVAL = 10.0
+    edits._stall_repeat_seconds = 1000.0
+    edits._STALL_MAX_WARNINGS = 1
+    edits._POST_RESULT_LIMBO_THRESHOLD_S = 60.0
+    cancel_event = anyio.Event()
+    edits.cancel_event = cancel_event
+
+    # post-result armed 100 s ago AND a ScheduleWakeup is still live.
+    # NOTE: deadline must be expressed in the fake clock's frame.
+    # ``time.monotonic()`` in fresh CI containers is small, so a
+    # real-time deadline can look already-expired against the fake
+    # clock's larger values (#333 Tier 2 test, CI vs local).
+    future_deadline = 1010.0 + 60.0
+    es = _make_engine_state(
+        result_received_at=900.0,
+        live_wakeups={"toolu_w1": future_deadline},
+    )
+    edits.stream = _make_stream(last_event_type="result", engine_state=es)
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            clock.set(1010.0)
+            await anyio.sleep(0.2)
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    # _real_pending was True (wakeup), so _expected_wait stays True even
+    # though _post_result_limbo also went True. Auto-cancel does NOT fire.
+    assert not cancel_event.is_set()
+
+
+# ---------------------------------------------------------------------------
+# #333 Task 4b — stall-suppression counter + session.summary integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_4b_bump_stall_suppression_records_counts() -> None:
+    """Task 4b: _bump_stall_suppression increments per-reason counters
+    on JsonlStreamState. Stream missing or counter dict missing must be
+    no-ops (defensive — the stall detector should never break on bookkeeping)."""
+    from untether.runner import JsonlStreamState
+
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    edits = _make_edits(transport, presenter, clock=_FakeClock(start=0.0))
+
+    # Stream is None initially -> no-op
+    edits.stream = None
+    edits._bump_stall_suppression("post_result")  # must not raise
+
+    # With a real stream, counts accumulate.
+    stream = JsonlStreamState(expected_session=None)
+    edits.stream = stream
+    edits._bump_stall_suppression("post_result")
+    edits._bump_stall_suppression("post_result")
+    edits._bump_stall_suppression("expected_wait")
+    edits._bump_stall_suppression("children_active")
+
+    assert stream.stall_suppression_counts == {
+        "post_result": 2,
+        "expected_wait": 1,
+        "children_active": 1,
+    }
+
+
+def test_551_auto_continue_notice_first_attempt() -> None:
+    """#551 Tier 1: first auto-continue (count=0) notice has 🔁 prefix and
+    no attempt suffix."""
+    from untether.runner_bridge import _format_auto_continue_notice
+
+    text = _format_auto_continue_notice(0)
+    assert text.startswith("\U0001f501 ")
+    assert "Auto-resuming" in text
+    assert "attempt" not in text  # no suffix on first attempt
+
+
+def test_551_auto_continue_notice_repeat_attempt() -> None:
+    """#551 Tier 1: repeat auto-continue (count=1+) shows attempt N+1."""
+    from untether.runner_bridge import _format_auto_continue_notice
+
+    text = _format_auto_continue_notice(1)
+    assert text.startswith("\U0001f501 ")
+    assert "(attempt 2)" in text
+
+
+@pytest.mark.anyio
+async def test_4b_stall_suppression_count_bumped_on_post_result() -> None:
+    """Task 4b: when the bridge stall detector takes the post-result
+    suppression branch, ``stall_suppression_counts['post_result']`` bumps."""
+    from untether.runner import JsonlStreamState
+
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=1000.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05
+    edits._STALL_THRESHOLD_TOOL = 0.05
+    edits._STALL_THRESHOLD_APPROVAL = 10.0
+    edits._stall_repeat_seconds = 1000.0
+    edits._STALL_MAX_WARNINGS = 5
+    edits._POST_RESULT_LIMBO_THRESHOLD_S = 600.0
+    cancel_event = anyio.Event()
+    edits.cancel_event = cancel_event
+
+    # post-result armed only 5 s ago — well within the limbo threshold.
+    stream = JsonlStreamState(expected_session=None)
+    stream.last_event_type = "result"
+    stream.engine_state = _make_engine_state(result_received_at=995.0)
+    edits.stream = stream
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            clock.set(1005.0)
+            await anyio.sleep(0.2)
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    assert stream.stall_suppression_counts.get("post_result", 0) >= 1

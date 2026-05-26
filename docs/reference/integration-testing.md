@@ -144,7 +144,7 @@ Tests for per-chat and per-topic settings that affect run behaviour. Use forum t
 |---|------|-------------|----------------|---------|
 | O1 | **Engine override** | `/agent set gemini`, then send a plain prompt (no directive) | Gemini runs, footer shows Gemini model | Per-chat engine default, override hierarchy |
 | O2 | **Reasoning level** | `/config` → Reasoning → enable, then send a prompt | Reasoning model used, footer reflects it | Reasoning flag in build_args |
-| O3 | **Trigger mode** | `/trigger mentions` in group, send plain text, then `@bot do something` | Plain text ignored, @mention triggers run | Trigger mode filtering |
+| O3 | **Listen mode** | `/listen mentions` in group, send plain text, then `@bot do something` | Plain text ignored, @mention triggers run | Listen mode filtering (renamed from `/trigger` in v0.35.3 [#297](https://github.com/littlebearapps/untether/issues/297); deprecated alias still works) |
 | O4 | **Ask mode toggle** | `/config` → Ask → off, send prompt that would trigger AskUserQuestion | Question auto-denied instead of shown | Ask mode auto-deny path |
 | O5 | **Context set** | `/ctx set test-claude main`, send prompt | Run uses test-claude project on main branch | Context resolution, project switching |
 | O6 | **Context clear** | `/ctx clear`, send prompt | Falls back to chat/project default | Context fallback chain |
@@ -197,7 +197,7 @@ Run quickly to verify all commands respond.
 | Q9 | `/stats` | Session statistics or empty | 1s |
 | Q10 | `/ctx` | Current context or "none set" | 1s |
 | Q11 | `/agent` | Current engine override or default | 1s |
-| Q12 | `/trigger` | Current trigger mode | 1s |
+| Q12 | `/listen` | Current listen mode | 1s |
 | Q13 | `/file` | Usage help or file browser | 1s |
 | Q14 | `/at 60s smoke test` | "⏳ Scheduled" confirmation; run fires after ~60s | 70s |
 | Q15 | `/at 5m test` then `/cancel` | Scheduling confirmation; cancel drops pending; no run after 5m | 10s (skip 5m wait) |
@@ -319,7 +319,10 @@ Integration tests are run by Claude Code via Telegram MCP tools (see "Automated 
 13. Report results: list each test as pass/fail/error with reason
     Distinguish Untether bugs from upstream engine API errors
 
-14. If all pass: commit, tag, release
+14. If all pass: write the attestation marker, then fleet-roll the rc/stable
+    scripts/run-integration-tests.sh X.Y.ZrcN --manual --tiers "tier7,tier1-claude,..." --notes "..."
+    scripts/fleet-rollout.sh X.Y.ZrcN          # parallel across lba-1/nsd/channelo/mac
+    See .claude/rules/release-discipline.md → Fleet rollout for the full gate + escape hatches.
 ```
 
 ### Per release type

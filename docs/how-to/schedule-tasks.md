@@ -1,6 +1,9 @@
 # Schedule tasks
 
-There are several ways to run tasks on a schedule: the `/at` command for quick one-shot delays, Telegram's built-in message scheduling, and Untether's trigger system (webhooks and cron).
+There are several ways to run tasks on a schedule: the `/at` command for quick one-shot delays, Telegram's built-in message scheduling, Untether's trigger system (webhooks and cron), and Loop mode for Claude Code's `/loop` and `ScheduleWakeup`.
+
+!!! note "Loop mode is opt-in"
+    By default, Untether does **not** fire Claude Code's session-scoped schedules after a turn ends — the `claude --print` subprocess exits and the cron task dies with it (verified empirically against `claude` v2.1.129/2.1.132 — upstream docs claiming `--resume` restores tasks are incorrect in `--print` mode). To enable autonomous loop firing via Telegram, turn on **Loop mode** in `/config → 🔁 Loop mode`. See [Loop mode](#loop-mode) below.
 
 ## One-shot delays with /at
 
@@ -27,6 +30,44 @@ When the delay expires, the prompt runs as a normal agent session. Use `/cancel`
 
 !!! note "Engine and project frozen at schedule time"
     When you run `/at`, Untether snapshots the chat's current project mapping and engine at that moment. That snapshot is what fires when the delay expires — changing `/agent`, `/ctx`, or `/planmode` afterwards does **not** affect already-scheduled delays. Cancel with `/cancel` and re-schedule if you change your mind. ([#362](https://github.com/littlebearapps/untether/issues/362))
+
+## Loop mode
+
+Claude Code has a built-in `/loop <interval> <prompt>` command (and a no-interval `/loop <prompt>` dynamic mode driven by `ScheduleWakeup`) for self-pacing autonomous work. Untether's **Loop mode** observes those tool calls at the JSONL layer, captures the user's intent, and re-fires each iteration when due — even after the subprocess exits. ([#289](https://github.com/littlebearapps/untether/issues/289))
+
+**Default OFF** — opt-in per chat via `/config → 🔁 Loop mode`. When OFF, behaviour matches the prior-version baseline: `/loop` registers a schedule during the turn but nothing fires after the subprocess exits.
+
+### How it works
+
+1. You type `/loop 5m check the deploy` in a Claude session.
+2. Claude calls `CronCreate(cron="*/5 * * * *", prompt="check the deploy", recurring=true)`.
+3. Untether observes the `tool_use` event and registers an Untether-side timer.
+4. The subprocess exits cleanly. Upstream's session-scoped cron dies with it.
+5. Each fire interval, Untether spawns `claude --resume <session_id>` with a wrapped re-issue prompt: `Loop iteration N: check the deploy. Do the task now; do not summarize old results unless necessary.`
+6. State persists to `active_loops.json` (sibling of `untether.toml`) — loops survive Untether restarts.
+
+### Runaway-safety caps
+
+The `[loop]` config has caps in case a loop runs longer than expected:
+
+- `max_iterations = 20` — cap on iteration count (NOT a cost cap)
+- `max_total_duration_hours = 4` — wall-clock cap (NOT a cost cap)
+- `expiry_days = 7` — auto-expire 7 days after creation (matches upstream)
+
+These bound loop duration regardless of cost. They are *not* a substitute for setting a budget — see "Cost considerations" below.
+
+### Cost considerations
+
+Autonomous loops consume API credits or your Claude subscription quota. A 24-hour `/loop 1m` can fire up to 1440 times. Cost per fire depends on conversation length:
+
+- Short conversations: ~$0.01–$0.05 per fire (cache-warm).
+- Long conversations: cache may evict between fires, costing $0.10–$0.50 per fire.
+
+**Set a daily budget BEFORE turning on Loop mode** in `/config → 💰 Cost & usage` (or `[cost_budget].max_cost_per_day` in `untether.toml`). The same daily cost cap applies to loop fires automatically — there is no separate per-loop budget. See [Cost budgets](cost-budgets.md) for setup.
+
+### Cancelling a loop
+
+`/cancel` drops all active loops for the current chat and writes a do-not-resume sentinel so the upstream session-scoped cron — if it ever survives — cannot be re-fired by Untether. `/new` does the same (treats `/new` as "wipe this chat's state").
 
 ## Telegram scheduling
 
@@ -93,6 +134,30 @@ permission_mode = "auto"
 ```
 
 Precedence (Claude): cron `permission_mode` > per-chat `/planmode` > engine config default. Every autonomous run logs `trigger.cron.permission_mode_override`. Valid values: `default`, `plan`, `auto`, `acceptEdits`, `bypassPermissions`. Claude-only for now; other engines silently ignore the field ([#332](https://github.com/littlebearapps/untether/issues/332) tracks full coverage).
+
+## Trigger provenance and history
+
+Trigger-initiated runs are visibly distinct from manual ones — every run footer carries a provenance marker:
+
+* `⏰ cron:<id>` — fired by a cron trigger
+* `⚡ webhook:<id>` — fired by a webhook trigger
+* `⏰ at:<token>` — fired by `/at`
+
+`/stats` reports a per-engine `(N triggered, M manual)` breakdown next to each engine line and on the totals row when at least one count is nonzero ([#271](https://github.com/littlebearapps/untether/issues/271) Tier 3).
+
+`/config → 📡 Triggers` (`config:tg`) lists every cron and webhook configured for the current chat — for crons: `describe_cron(schedule, timezone)`, project, engine, last-fired relative time; for webhooks: path, auth scheme, project, engine, last-fired. Lists are scoped to the current chat, capped at 10 entries with a `…and N more (see untether.toml)` overflow marker. The page also hosts the master pause/resume toggle (see below). See [Inline settings](inline-settings.md#triggers-page) for the navigation walkthrough.
+
+Last-fired times are persisted to `triggers_history.json` (sibling of `untether.toml`) so the values survive a restart. Renaming a trigger ID in TOML leaves a stale entry that operators can manually delete (no auto-prune to avoid losing data on transient TOML errors).
+
+## Pausing all triggers
+
+When you need to silence the bot for maintenance, demos, or a noisy upstream, the master pause toggle suspends all cron firing and webhook dispatch globally without changing your config ([#294](https://github.com/littlebearapps/untether/issues/294)).
+
+* **From `/config`:** open `📡 Triggers` (or use the one-button toggle row on the home page when triggers are configured) and tap **Pause**.
+* **While paused:** the cron scheduler skips its tick (`run_once` crons are not consumed during the pause and fire on the next matching tick after resume); the webhook server returns `503 triggers paused` with `Retry-After: 60` instead of dispatching; `/health` reports `{"status":"paused","paused":true}` for external monitors; `/ping` shows `⏸ triggers paused: … (suspended)`.
+* **Restart auto-resumes** — pause is in-memory only by design; restarting the bot is a safe escape hatch.
+
+Tap **Resume** in the same page to clear the pause.
 
 ## Webhook triggers
 

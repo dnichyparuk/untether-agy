@@ -41,12 +41,12 @@ from .commands.handlers import (
     handle_ctx_command,
     handle_file_command,
     handle_file_put_default,
+    handle_listen_command,
     handle_media_group,
     handle_model_command,
     handle_new_command,
     handle_reasoning_command,
     handle_topic_command,
-    handle_trigger_command,
     parse_callback_data,
     parse_slash_command,
     run_engine,
@@ -54,11 +54,12 @@ from .commands.handlers import (
     set_command_menu,
     should_show_resume_line,
 )
-from .commands.parse import is_cancel_command
+from .commands.parse import is_cancel_command, parse_dot_typo
 from .commands.reply import make_reply
 from .context import _merge_topic_context, _usage_ctx_set, _usage_topic
 from .engine_defaults import resolve_engine_for_message
 from .engine_overrides import merge_overrides
+from .listen_mode import resolve_listen_mode, should_trigger_run
 from .topic_state import TopicStateStore, resolve_state_path
 from .topics import (
     _maybe_rename_topic,
@@ -68,7 +69,6 @@ from .topics import (
     _topics_chat_project,
     _validate_topics_setup,
 )
-from .trigger_mode import resolve_trigger_mode, should_trigger_run
 from .types import (
     TelegramCallbackQuery,
     TelegramIncomingMessage,
@@ -86,6 +86,17 @@ _SEEN_MESSAGES_LIMIT = 2048
 _SEEN_UPDATES_LIMIT = 4096
 
 _handle_file_put_default = handle_file_put_default
+
+# #528: AskUserQuestion text-reply echo. Earlier versions hard-sliced at
+# [:100] which truncated mid-word with no ellipsis; the agent always
+# received the full reply but the user couldn't see it in the chat.
+_ANSWERED_ECHO_MAX = 300
+
+
+def _format_answered_echo(text: str) -> str:
+    if len(text) <= _ANSWERED_ECHO_MAX:
+        return f"↩️ Answered: {text}"
+    return f"↩️ Answered: {text[: _ANSWERED_ECHO_MAX - 1]}…"
 
 
 def _chat_session_key(
@@ -129,6 +140,7 @@ async def _resolve_engine_run_options(
         show_resume_line=merged.show_resume_line,
         budget_enabled=merged.budget_enabled,
         budget_auto_cancel=merged.budget_auto_cancel,
+        loop_enabled=merged.loop_enabled,
     )
 
 
@@ -235,6 +247,65 @@ async def _notify_restart_required(cfg: TelegramBridgeConfig, keys: list[str]) -
     logger.info(
         "config.reload.restart_notify.sent",
         keys=keys,
+        targets=sorted(targets),
+        sent_count=sent_count,
+    )
+
+
+async def _notify_reload_applied(
+    cfg: TelegramBridgeConfig,
+    *,
+    path: Path,
+    hot_keys: list[str],
+    restart_keys: list[str],
+) -> None:
+    """#547 axis 2 / #548: broadcast a hot-reload confirmation message so
+    agents and users see "did my edit work?" answered in-chat (instead of
+    having to switch to ``journalctl``). The headline framing ("No restart
+    needed.") flips the trained-in agent reflex to ``systemctl restart``
+    after editing config.
+
+    Reuses the same broadcast pattern as ``_notify_restart_required``: send
+    to every active project chat + admin DMs, falling back to
+    ``cfg.chat_id`` if no routed targets exist. Per-chat failures are
+    logged and skipped — one bad chat can't mask the affirmation from
+    the rest.
+    """
+    if not hot_keys and not restart_keys:
+        return
+    from ..config_reload_notification import format_reload_notification
+
+    text = format_reload_notification(
+        path=path, hot_keys=hot_keys, restart_keys=restart_keys
+    )
+    targets: set[int] = set()
+    targets.update(cfg.runtime.project_chat_ids())
+    targets.update(cfg.allowed_user_ids or ())
+    if not targets:
+        targets.add(cfg.chat_id)
+    sent_count = 0
+    for chat_id in sorted(targets):
+        try:
+            sent = await cfg.exec_cfg.transport.send(
+                channel_id=chat_id,
+                message=RenderedMessage(
+                    text=text,
+                    extra={"parse_mode": "Markdown"},
+                ),
+                options=SendOptions(notify=False),  # non-disruptive
+            )
+            if sent is not None:
+                sent_count += 1
+        except Exception as exc:  # noqa: BLE001 — logged then continue
+            logger.warning(
+                "config.reload.applied_notify.failed",
+                chat_id=chat_id,
+                error=str(exc),
+            )
+    logger.info(
+        "config.reload.applied_notify.sent",
+        hot_keys=hot_keys,
+        restart_keys=restart_keys,
         targets=sorted(targets),
         sent_count=sent_count,
     )
@@ -400,9 +471,11 @@ def _dispatch_builtin_command(
         task_group.start_soon(handler)
         return True
 
-    if command_id == "trigger":
+    if command_id in {"listen", "trigger"}:
+        # #297: /trigger is a deprecated alias for /listen. The handler
+        # prepends a deprecation notice when invoked_as="trigger".
         handler = partial(
-            handle_trigger_command,
+            handle_listen_command,
             cfg,
             msg,
             args_text,
@@ -411,6 +484,7 @@ def _dispatch_builtin_command(
             chat_prefs,
             resolved_scope=resolved_scope,
             scope_chat_ids=scope_chat_ids,
+            invoked_as=command_id,
         )
         task_group.start_soon(handler)
         return True
@@ -1003,14 +1077,14 @@ class MediaGroupBuffer:
             del self._groups[key]
             if not messages:
                 return
-            trigger_mode = await resolve_trigger_mode(
+            listen_mode = await resolve_listen_mode(
                 chat_id=messages[0].chat_id,
                 thread_id=messages[0].thread_id,
                 chat_prefs=self._chat_prefs,
                 topic_store=self._topic_store,
             )
             command_ids = self._command_ids()
-            if trigger_mode == "mentions" and not any(
+            if listen_mode == "mentions" and not any(
                 should_trigger_run(
                     msg,
                     bot_username=self._bot_username,
@@ -1028,6 +1102,7 @@ class MediaGroupBuffer:
                     self._topic_store,
                     self._run_prompt_from_upload,
                     self._resolve_prompt_message,
+                    chat_prefs=self._chat_prefs,
                 )
                 logger.debug(
                     "media_group.flush.ok",
@@ -1305,8 +1380,10 @@ async def run_main_loop(
                 state_path=str(resolve_prefs_path(config_path)),
             )
             from ..session_stats import init_stats
+            from ..triggers.history import init_history
 
             init_stats(config_path)
+            init_history(config_path)
         if cfg.session_mode == "chat":
             if config_path is None:
                 raise ConfigError(
@@ -1346,7 +1423,7 @@ async def run_main_loop(
             me = await cfg.bot.get_me()
         except Exception as exc:  # noqa: BLE001
             logger.info(
-                "trigger_mode.bot_username.failed",
+                "listen_mode.bot_username.failed",
                 error=str(exc),
                 error_type=exc.__class__.__name__,
             )
@@ -1354,7 +1431,7 @@ async def run_main_loop(
         if me is not None and me.username:
             state.bot_username = me.username.lower()
         else:
-            logger.info("trigger_mode.bot_username.unavailable")
+            logger.info("listen_mode.bot_username.unavailable")
         # Install graceful shutdown signal handlers
 
         def _shutdown_handler(signum: int, frame: object) -> None:
@@ -1390,6 +1467,12 @@ async def run_main_loop(
                 refresh_commands()
                 refresh_topics_scope()
                 await set_command_menu(cfg)
+                # #547 axis 2 / #548: accumulate the keys that actually
+                # changed in this reload so the broadcast at the end of
+                # handle_reload can tell the user (and any agent reading
+                # in next-turn context) whether a restart is required.
+                _reload_hot_keys: list[str] = []
+                _reload_restart_keys: list[str] = []
                 if state.transport_snapshot is not None:
                     new_snapshot = reload.settings.transports.telegram.model_dump()
                     changed = _diff_keys(state.transport_snapshot, new_snapshot)
@@ -1402,6 +1485,8 @@ async def run_main_loop(
                         restart_only = TelegramTransportSettings.RESTART_REQUIRED_FIELDS
                         restart_keys = [k for k in changed if k in restart_only]
                         hot_keys = [k for k in changed if k not in restart_only]
+                        _reload_hot_keys.extend(hot_keys)
+                        _reload_restart_keys.extend(restart_keys)
                         if restart_keys:
                             logger.warning(
                                 "config.reload.transport_config_changed",
@@ -1442,6 +1527,26 @@ async def run_main_loop(
                         restart_required=True,
                     )
                     state.transport_id = reload.settings.transport
+
+                # #547 axis 2 / #548: broadcast the affirmative
+                # "Hot-reloaded — No restart needed." (or, if any
+                # restart-only key was edited, the matching
+                # "Restart required" / "Partial reload" message). The
+                # headline framing flips the trained-in agent reflex to
+                # ``systemctl restart`` after editing config; agents read
+                # this message in next-turn context and adapt.
+                if _reload_hot_keys or _reload_restart_keys:
+                    try:
+                        await _notify_reload_applied(
+                            cfg,
+                            path=reload.config_path,
+                            hot_keys=_reload_hot_keys,
+                            restart_keys=_reload_restart_keys,
+                        )
+                    except Exception:  # noqa: BLE001 — never break reload
+                        logger.warning(
+                            "config.reload.applied_notify.crashed", exc_info=True
+                        )
 
                 # --- Hot-reload trigger configuration ---
                 if trigger_manager is not None:
@@ -1495,10 +1600,18 @@ async def run_main_loop(
 
                 active = len(state.running_tasks)
                 pending_at = at_scheduler.active_count()
+                # #289: include loop fires in the shutdown summary so ops
+                # can see how many were pending at drain time.  Pending
+                # loops are persisted to disk; the task-group cancel below
+                # cancels their in-flight `_arm_timer` sleeps cleanly.
+                from .. import loop_scheduler
+
+                pending_loops = loop_scheduler.active_count()
                 logger.info(
                     "shutdown.draining",
                     active_runs=active,
                     pending_at=pending_at,
+                    pending_loops=pending_loops,
                 )
 
                 if active > 0:
@@ -1686,6 +1799,33 @@ async def run_main_loop(
                 run_job,
                 cfg.exec_cfg.transport,
                 cfg.chat_id,
+            )
+
+            # --- /loop and ScheduleWakeup observation (#289) ---
+            from .. import loop_scheduler
+
+            loop_state_path = None
+            config_path_for_loops = cfg.runtime.config_path
+            if config_path_for_loops is not None:
+                loop_state_path = config_path_for_loops.with_name(
+                    loop_scheduler.STATE_FILENAME
+                )
+
+            def _is_chat_busy(chat_id_in: int) -> bool:
+                """Drop a loop fire if the chat already has a run in flight
+                — mirrors upstream's "no catch-up" semantic."""
+                for ref in state.running_tasks:
+                    if getattr(ref, "channel_id", None) == chat_id_in:
+                        return True
+                return False
+
+            loop_scheduler.install(
+                tg,
+                run_job,
+                cfg.exec_cfg.transport,
+                cfg.chat_id,
+                state_path=loop_state_path,
+                is_chat_busy=_is_chat_busy,
             )
 
             # --- Trigger system (webhooks + cron) ---
@@ -2181,13 +2321,13 @@ async def run_main_loop(
                 ):
                     return
 
-                trigger_mode = await resolve_trigger_mode(
+                listen_mode = await resolve_listen_mode(
                     chat_id=chat_id,
                     thread_id=msg.thread_id,
                     chat_prefs=state.chat_prefs,
                     topic_store=state.topic_store,
                 )
-                if trigger_mode == "mentions" and not should_trigger_run(
+                if listen_mode == "mentions" and not should_trigger_run(
                     msg,
                     bot_username=state.bot_username,
                     runtime=cfg.runtime,
@@ -2205,7 +2345,11 @@ async def run_main_loop(
                         max_bytes=cfg.voice_max_bytes,
                         reply=reply,
                         base_url=cfg.voice_transcription_base_url,
-                        api_key=cfg.voice_transcription_api_key,
+                        api_key=(
+                            cfg.voice_transcription_api_key.get_secret_value()
+                            if cfg.voice_transcription_api_key is not None
+                            else None
+                        ),
                     )
                     if text is None:
                         return
@@ -2295,11 +2439,10 @@ async def run_main_loop(
                     from ..runners.claude import (
                         answer_ask_question,
                         answer_ask_question_with_options,
-                        format_question_message,
                         get_ask_question_flow,
                         get_pending_ask_request,
-                        get_question_option_buttons,
                     )
+                    from .commands.ask_question import send_next_ask_question_message
 
                     # Check for active option flow in "Other" text mode first
                     flow = get_ask_question_flow(channel_id=msg.chat_id)
@@ -2314,21 +2457,16 @@ async def run_main_loop(
                         flow.current_index += 1
 
                         if flow.current_index < len(flow.questions):
-                            # More questions — show next one
-                            # Note: we can't easily edit the progress message from
-                            # here, so just send a new message with the next question
-                            msg_text = format_question_message(flow)
-                            buttons = get_question_option_buttons(flow)
-                            from ..transport import RenderedMessage as _RM
-
-                            next_msg = _RM(
-                                text=msg_text,
-                                extra={
-                                    "parse_mode": "HTML",
-                                    "reply_markup": {"inline_keyboard": buttons},
-                                },
+                            # More questions — send next one as a new message
+                            # (callback-button continuation edits in place via
+                            # ctx.executor.edit; see commands/ask_question.py).
+                            await send_next_ask_question_message(
+                                cfg.exec_cfg.transport,
+                                chat_id=chat_id,
+                                user_msg_id=msg.message_id,
+                                thread_id=msg.thread_id,
+                                flow=flow,
                             )
-                            await reply(text=next_msg)
                             return
                         else:
                             # All done — send structured answer
@@ -2336,7 +2474,7 @@ async def run_main_loop(
                                 flow.request_id
                             )
                             if success:
-                                await reply(text=f"↩️ Answered: {text[:100]}")
+                                await reply(text=_format_answered_echo(text))
                             return
 
                     pending_ask = get_pending_ask_request(channel_id=msg.chat_id)
@@ -2349,8 +2487,41 @@ async def run_main_loop(
                         )
                         success = await answer_ask_question(ask_req_id, text)
                         if success:
-                            await reply(text=f"↩️ Answered: {text[:100]}")
+                            await reply(text=_format_answered_echo(text))
                             return
+
+                # #523: catch `.new`-style leading-dot typos for slash
+                # commands and surface a hint instead of dispatching a
+                # full agent subprocess (which costs the per-run cold-
+                # start of OAuth handshake + MCP catalog probe + preamble
+                # injection, then leaves the user to cancel).
+                # Only fires for plain text inputs (not voice transcripts
+                # or document captions) so user-typed prose like
+                # ``.new project idea: ...`` stays out of the heuristic.
+                if (
+                    not is_voice_transcribed
+                    and msg.voice is None
+                    and msg.document is None
+                ):
+                    typo_cmd = parse_dot_typo(
+                        text, state.command_ids | state.reserved_chat_commands
+                    )
+                    if typo_cmd is not None:
+                        logger.info(
+                            "command.dot_typo.suppressed",
+                            chat_id=chat_id,
+                            typed=text[:40],
+                            command=typo_cmd,
+                        )
+                        await reply(
+                            text=(
+                                f"Did you mean `/{typo_cmd}`? "
+                                f"(The leading `.` looks like a typo for `/`.)\n\n"
+                                f"Re-send with the slash if you meant the command, "
+                                f"or rephrase to send to the agent."
+                            )
+                        )
+                        return
 
                 pending = _PendingPrompt(
                     msg=msg,
@@ -2379,13 +2550,17 @@ async def run_main_loop(
                     return
                 forward_coalescer.schedule(pending)
 
-            # rc4 (#286): read allowed_user_ids from cfg on each update so
-            # hot-reload of the allowlist takes effect immediately.
-            if not cfg.allowed_user_ids:
-                logger.warning(
-                    "security.no_allowed_users",
-                    hint="allowed_user_ids is empty — any user in the chat can run commands. "
-                    "Set [transports.telegram] allowed_user_ids to restrict access.",
+            # #377: empty `allowed_user_ids` is now a startup ConfigError
+            # (see TelegramTransportSettings._validate_allowed_user_ids_or_optin).
+            # The only way to reach this hook with no allowlist is the explicit
+            # `allow_any_user = true` opt-in — log it at INFO every boot so the
+            # deviation stays visible in journalctl.
+            if getattr(cfg, "allow_any_user", False) or not cfg.allowed_user_ids:
+                logger.info(
+                    "security.allow_any_user",
+                    hint="allow_any_user=true is in effect — bot accepts "
+                    "commands from any Telegram user. Intended for "
+                    "demos/dev only.",
                 )
 
             async def _safe_answer_callback(query_id: str) -> None:

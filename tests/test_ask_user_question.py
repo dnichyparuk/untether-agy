@@ -707,3 +707,293 @@ def test_translate_registers_ask_with_channel_id() -> None:
     channel_id, question = _PENDING_ASK_REQUESTS["req-chan-1"]
     assert channel_id == CHAT_A
     assert question == "Which?"
+
+
+# ---------------------------------------------------------------------------
+# Regression: #488 — multi-question flow text-reply continuation
+# ---------------------------------------------------------------------------
+
+
+class _RecordingTransport:
+    """Minimal Transport stub that records send/edit/delete calls."""
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[int, object, object]] = []
+
+    async def send(self, *, channel_id, message, options=None):  # type: ignore[no-untyped-def]
+        self.sent.append((channel_id, message, options))
+        return
+
+    async def edit(self, ref, message, wait=True):  # type: ignore[no-untyped-def]
+        return None
+
+    async def delete(self, ref):  # type: ignore[no-untyped-def]
+        return None
+
+
+@pytest.mark.anyio
+async def test_send_next_ask_question_message_uses_rendered_message() -> None:
+    """Regression for #488: text-reply continuation must call transport.send
+    with a RenderedMessage carrying the inline keyboard, NOT pass it to
+    send_plain (which would TypeError on str-only `text` kwarg)."""
+    from untether.telegram.commands.ask_question import (
+        send_next_ask_question_message,
+    )
+    from untether.transport import MessageRef, RenderedMessage, SendOptions
+
+    flow = AskQuestionState(
+        request_id="req-488",
+        channel_id=-12345,
+        questions=[
+            {
+                "question": "First?",
+                "options": [{"label": "A"}, {"label": "B"}],
+            },
+            {
+                "question": "Second?",
+                "options": [{"label": "C"}, {"label": "D"}],
+            },
+        ],
+        current_index=1,  # user already answered Q1 by typing
+    )
+
+    transport = _RecordingTransport()
+
+    await send_next_ask_question_message(
+        transport,  # type: ignore[arg-type]
+        chat_id=-12345,
+        user_msg_id=678,
+        thread_id=42,
+        flow=flow,
+    )
+
+    assert len(transport.sent) == 1
+    channel_id, message, options = transport.sent[0]
+    assert channel_id == -12345
+    assert isinstance(message, RenderedMessage)
+    assert "2 of 2" in message.text
+    assert message.extra is not None
+    assert message.extra["parse_mode"] == "HTML"
+    assert "inline_keyboard" in message.extra["reply_markup"]
+    # Buttons present for question 2's options:
+    keyboard = message.extra["reply_markup"]["inline_keyboard"]
+    assert len(keyboard) >= 1
+    assert isinstance(options, SendOptions)
+    assert options.reply_to == MessageRef(channel_id=-12345, message_id=678)
+    assert options.thread_id == 42
+
+
+@pytest.mark.anyio
+async def test_send_next_ask_question_message_no_thread() -> None:
+    """thread_id=None passes through to SendOptions (private chats / non-forum groups)."""
+    from untether.telegram.commands.ask_question import (
+        send_next_ask_question_message,
+    )
+
+    flow = AskQuestionState(
+        request_id="req-488-b",
+        channel_id=-9999,
+        questions=[
+            {"question": "Q1", "options": [{"label": "A"}]},
+            {"question": "Q2", "options": [{"label": "B"}]},
+        ],
+        current_index=1,
+    )
+    transport = _RecordingTransport()
+
+    await send_next_ask_question_message(
+        transport,  # type: ignore[arg-type]
+        chat_id=-9999,
+        user_msg_id=1,
+        thread_id=None,
+        flow=flow,
+    )
+
+    _, _, options = transport.sent[0]
+    assert options.thread_id is None
+
+
+# ---------------------------------------------------------------------------
+# #550 — AskQuestionCommand.handle clears inline keyboard on final answer
+# ---------------------------------------------------------------------------
+
+
+def _make_command_ctx(args_text: str):
+    """Build a minimal CommandContext-like mock for AskQuestionCommand.handle tests."""
+    from unittest.mock import MagicMock
+
+    ctx = MagicMock()
+    ctx.args_text = args_text
+    ctx.executor = AsyncMock()
+    ctx.executor.edit = AsyncMock(return_value=None)
+    ctx.message = MagicMock()
+    return ctx
+
+
+@pytest.mark.anyio
+async def test_550_final_answer_clears_inline_keyboard(monkeypatch) -> None:
+    """#550: After the user answers the last question in a multi-Q flow, the
+    inline keyboard on the question message must be stripped via executor.edit."""
+    from untether.telegram.commands import ask_question as cmd_mod
+    from untether.transport import RenderedMessage
+
+    flow = AskQuestionState(
+        request_id="req-550-a",
+        channel_id=CHAT_A,
+        questions=[
+            {"question": "First?", "options": [{"label": "A"}, {"label": "B"}]},
+            {"question": "Second?", "options": [{"label": "C"}, {"label": "D"}]},
+        ],
+        current_index=1,  # already answered Q1, about to answer Q2
+        answers={"First?": "A"},
+    )
+    _ASK_QUESTION_FLOWS[flow.request_id] = flow
+
+    async def _fake_answer(rid: str) -> bool:
+        # Mirror real cleanup so subsequent get_ask_question_flow() returns None.
+        _ASK_QUESTION_FLOWS.pop(rid, None)
+        return True
+
+    monkeypatch.setattr(
+        "untether.runners.claude.answer_ask_question_with_options",
+        _fake_answer,
+    )
+
+    ctx = _make_command_ctx("opt:0")  # final answer = option 0 ("C")
+    result = await cmd_mod.AskQuestionCommand().handle(ctx)
+
+    # Exactly one edit call with empty inline_keyboard.
+    assert ctx.executor.edit.await_count == 1
+    edit_args, edit_kwargs = ctx.executor.edit.await_args
+    # First positional is ctx.message, second is the cleared RenderedMessage.
+    assert edit_args[0] is ctx.message
+    cleared = edit_args[1]
+    assert isinstance(cleared, RenderedMessage)
+    assert cleared.extra["reply_markup"]["inline_keyboard"] == []
+
+    # The CommandResult still includes the Q&A summary toast.
+    assert result is not None
+    assert "Answers sent" in result.text
+    assert "First?" in result.text and "Second?" in result.text
+
+
+@pytest.mark.anyio
+async def test_550_keyboard_not_cleared_when_answer_fails(monkeypatch) -> None:
+    """#550: If answer_ask_question_with_options returns False (session ended),
+    leave the buttons in place so the user knows the answer didn't land."""
+    from untether.telegram.commands import ask_question as cmd_mod
+
+    flow = AskQuestionState(
+        request_id="req-550-b",
+        channel_id=CHAT_A,
+        questions=[
+            {"question": "Q1", "options": [{"label": "A"}]},
+            {"question": "Q2", "options": [{"label": "B"}]},
+        ],
+        current_index=1,
+        answers={"Q1": "A"},
+    )
+    _ASK_QUESTION_FLOWS[flow.request_id] = flow
+
+    async def _fail_answer(rid: str) -> bool:
+        _ASK_QUESTION_FLOWS.pop(rid, None)
+        return False
+
+    monkeypatch.setattr(
+        "untether.runners.claude.answer_ask_question_with_options",
+        _fail_answer,
+    )
+
+    ctx = _make_command_ctx("opt:0")
+    result = await cmd_mod.AskQuestionCommand().handle(ctx)
+
+    ctx.executor.edit.assert_not_awaited()
+    assert result is not None
+    assert "Failed to send answers" in result.text
+
+
+@pytest.mark.anyio
+async def test_550_edit_failure_does_not_block_answer(monkeypatch, capsys) -> None:
+    """#550: If executor.edit raises (e.g. message-not-found), the warning is
+    logged but the answer-sent CommandResult is still returned."""
+    from untether.telegram.commands import ask_question as cmd_mod
+
+    flow = AskQuestionState(
+        request_id="req-550-c",
+        channel_id=CHAT_A,
+        questions=[
+            {"question": "Q1", "options": [{"label": "A"}]},
+            {"question": "Q2", "options": [{"label": "B"}]},
+        ],
+        current_index=1,
+        answers={"Q1": "A"},
+    )
+    _ASK_QUESTION_FLOWS[flow.request_id] = flow
+
+    async def _ok_answer(rid: str) -> bool:
+        _ASK_QUESTION_FLOWS.pop(rid, None)
+        return True
+
+    monkeypatch.setattr(
+        "untether.runners.claude.answer_ask_question_with_options",
+        _ok_answer,
+    )
+
+    ctx = _make_command_ctx("opt:0")
+    ctx.executor.edit = AsyncMock(side_effect=RuntimeError("message not found"))
+
+    result = await cmd_mod.AskQuestionCommand().handle(ctx)
+
+    assert ctx.executor.edit.await_count == 1
+    assert result is not None
+    assert "Answers sent" in result.text
+    # Warning was logged (structlog routes the event name to stdout in tests).
+    out = capsys.readouterr().out
+    assert "ask_question.keyboard_clear_failed" in out
+
+
+@pytest.mark.anyio
+async def test_550_multi_question_edits_twice(monkeypatch) -> None:
+    """#550: 2-question flow: Q1->Q2 edit fires the question swap (existing
+    behavior), then Q2 final answer fires the keyboard-clear edit (new)."""
+    from untether.telegram.commands import ask_question as cmd_mod
+    from untether.transport import RenderedMessage
+
+    flow = AskQuestionState(
+        request_id="req-550-d",
+        channel_id=CHAT_A,
+        questions=[
+            {"question": "Q1", "options": [{"label": "A"}, {"label": "B"}]},
+            {"question": "Q2", "options": [{"label": "C"}, {"label": "D"}]},
+        ],
+        current_index=0,
+        answers={},
+    )
+    _ASK_QUESTION_FLOWS[flow.request_id] = flow
+
+    async def _ok_answer(rid: str) -> bool:
+        _ASK_QUESTION_FLOWS.pop(rid, None)
+        return True
+
+    monkeypatch.setattr(
+        "untether.runners.claude.answer_ask_question_with_options",
+        _ok_answer,
+    )
+
+    # Click Q1 option 0 -> Q1->Q2 transition edit
+    ctx1 = _make_command_ctx("opt:0")
+    result1 = await cmd_mod.AskQuestionCommand().handle(ctx1)
+    assert result1 is None  # transition returns None
+    assert ctx1.executor.edit.await_count == 1
+    transition_msg = ctx1.executor.edit.await_args[0][1]
+    assert isinstance(transition_msg, RenderedMessage)
+    # Q2 question buttons present (non-empty keyboard)
+    assert transition_msg.extra["reply_markup"]["inline_keyboard"]
+
+    # Click Q2 option 0 -> final clear edit
+    ctx2 = _make_command_ctx("opt:0")
+    result2 = await cmd_mod.AskQuestionCommand().handle(ctx2)
+    assert result2 is not None  # final returns CommandResult
+    assert ctx2.executor.edit.await_count == 1
+    cleared_msg = ctx2.executor.edit.await_args[0][1]
+    assert cleared_msg.extra["reply_markup"]["inline_keyboard"] == []

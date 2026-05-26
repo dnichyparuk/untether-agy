@@ -78,7 +78,8 @@ systemctl --user restart untether-dev    # dev
 |-----|------|---------|-------|
 | `bot_token` | string | (required) | 🔄 Telegram bot token from @BotFather. Restart-required. |
 | `chat_id` | int | (required) | 🔄 Default chat id. Restart-required. |
-| `allowed_user_ids` | int[] | `[]` | Allowed sender user ids. Empty disables sender filtering; when set, only these users can interact (including DMs). |
+| `allowed_user_ids` | int[] | (required, non-empty) | Allowed sender user ids. **Required for security as of v0.35.3** ([#377](https://github.com/littlebearapps/untether/issues/377)) — set to a non-empty list of Telegram user IDs (your own user id is the typical minimum). An empty list now triggers a hard `ConfigError` at startup unless you opt in to `allow_any_user = true` (see below). |
+| `allow_any_user` | bool | `false` | **Dev/demo escape hatch** ([#377](https://github.com/littlebearapps/untether/issues/377)). Set to `true` to keep the prior insecure-default behaviour where any Telegram user who knows the bot username can send commands. Logged at INFO on every boot (`security.allow_any_user`) so the deviation is visible in `journalctl`. Use only for hackathons, demos, or local dev. |
 | `message_overflow` | `"trim"`\|`"split"` | `"split"` | 🔄 How to handle long final responses. Restart-required. |
 | `forward_coalesce_s` | float | `1.0` | Quiet window for combining a prompt with immediately-following forwarded messages; set `0` to disable. |
 | `voice_transcription` | bool | `false` | Enable voice note transcription. |
@@ -225,14 +226,19 @@ Controls progress message rendering during agent runs.
     [progress]
     verbosity = "verbose"
     max_actions = 8
+    heartbeat_interval = 30
     ```
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
 | `verbosity` | `"compact"` \| `"verbose"` | `"compact"` | `compact` shows status + title only. `verbose` adds tool detail lines (file paths, commands, patterns). |
 | `max_actions` | int (0–50) | `5` | Maximum action lines shown in the progress message. |
+| `heartbeat_interval` | int (5–120) | `30` | Heartbeat tick that re-renders progress messages so long-running tools surface an elapsed-time tail (e.g. `▸ Bash · 3m 47s · npm run build`) without waiting for the next JSONL event ([#481](https://github.com/littlebearapps/untether/issues/481)). |
 
 Per-chat override: `/verbose on` and `/verbose off` override the config default for the current chat without editing the TOML file. `/verbose clear` removes the override.
+
+!!! tip "Hot-reload"
+    Editing `[progress]` in `untether.toml` applies on the next run without restart ([#269](https://github.com/littlebearapps/untether/issues/269)). The default presenter and per-chat `/verbose` overrides both pick up the new values.
 
 ## `cost_budget`
 
@@ -257,6 +263,18 @@ Per-chat override: `/verbose on` and `/verbose off` override the config default 
 
 Budget alerts always appear regardless of `[footer]` settings.
 
+!!! note "Cumulative session cost is not capped"
+    Sessions can stack many runs via `/continue`, follow-up prompts, or
+    a long back-and-forth dogfooding chat. A single session has been
+    observed to cumulate over US$100 across 5 sub-runs even though each
+    individual run was well under `max_cost_per_run`
+    ([#517](https://github.com/littlebearapps/untether/issues/517)). If
+    you need a ceiling that spans sessions, set `max_cost_per_day` —
+    Untether tracks daily cost across all sessions and triggers
+    `cost_budget.exceeded` once the day's spend crosses it. A
+    `max_cost_per_session` knob is not currently provided; file a
+    feature request if your workflow needs one.
+
 ## `watchdog`
 
 === "toml"
@@ -276,6 +294,10 @@ Budget alerts always appear regardless of `[footer]` settings.
     notify_catalog_refresh = false
     prespawn_ram_warn_mb = 2000
     prespawn_ram_block_mb = 500
+    claude_stream_idle_timeout_ms = 300_000
+    post_result_idle_enabled = true
+    post_result_idle_timeout = 600.0
+    bash_grace_seconds = 60.0
     ```
 
 | Key | Type | Default | Notes |
@@ -293,8 +315,43 @@ Budget alerts always appear regardless of `[footer]` settings.
 | `notify_catalog_refresh` | bool | `false` | Opt-in experimental ([#365](https://github.com/littlebearapps/untether/issues/365)) — after each `tool_result` batch, send an `mcp_status` control_request on Claude's stdin to nudge the catalog. Documented parent→CLI primitive from Anthropic's `claude-agent-sdk-python` (`get_mcp_status`). Logs `catalog.refresh_sent` INFO on success. Default `false` because the upstream refresh effect on the catalog UI is empirical; enable on staging to measure. Claude runner only. |
 | `prespawn_ram_warn_mb` | int | `2000` | Pre-spawn RAM guard ([#350](https://github.com/littlebearapps/untether/issues/350)) — emit `subprocess.prespawn.ram_warning` when free RAM is below this threshold (MB) at engine spawn. `0` disables the warn tier. |
 | `prespawn_ram_block_mb` | int | `500` | Refuse to spawn the engine subprocess (yields `CompletedEvent(ok=False, error="🛑 Insufficient RAM…")`) when free RAM is below this threshold (MB). `0` disables the block tier; `0` for both fully disables the guard. Must be strictly less than `prespawn_ram_warn_mb` when both are set. |
+| `claude_stream_idle_timeout_ms` | int | `300_000` | Sets `CLAUDE_STREAM_IDLE_TIMEOUT_MS` in the Claude Code subprocess env via `setdefault` ([#438](https://github.com/littlebearapps/untether/issues/438)). Range 30 s – 30 min. Long-form opus 4.7 1M plan-mode generations can legitimately idle the SSE stream past 5 min; deployments hitting upstream Anthropic API stalls (Type A — mid-generation) can raise this to `600_000` or `900_000` to ride out longer silences. Type-B failures (cold-start zero-byte, `num_turns ≤ 1 && duration_api_ms == 0`) are upstream API outages — raising this won't help; the failure error message now classifies both modes inline. Shell-set `CLAUDE_STREAM_IDLE_TIMEOUT_MS` still wins. |
+| `post_result_idle_enabled` | bool | `true` | Claude post-result idle watchdog ([#333](https://github.com/littlebearapps/untether/issues/333)) — closes Claude's stdin cleanly after `post_result_idle_timeout` of silence following a `result` event so multi-turn sessions don't sit alive (and billable) for the full upstream ~36 min idle window. Set `false` to disable (Claude will sit idle until the upstream CLI exits on its own). The clean exit is auto-continue safe — `last_event_type=result` is excluded from the auto-continue gate. |
+| `post_result_idle_timeout` | float | `600.0` | Seconds the watchdog waits after a `result` event before closing stdin (30–3600). The first `result` also emits a `✓ turn complete` footer hint so users know the turn is done; when the watchdog actually fires it sends one Telegram message: `✓ turn complete · session closed after Nm idle`. Re-arms (instead of closing) if a control_request or AskUserQuestion is mid-flight, so a button click in flight is never orphaned. |
+| `bash_grace_seconds` | float | `60.0` | Stall-warning grace window for Bash / BashOutput / KillShell tools ([#481](https://github.com/littlebearapps/untether/issues/481)). Range 5–300. While the most-recent action is one of these and within this window of its start, stall warnings (and the `_STALL_MAX_WARNINGS` auto-cancel arm) are suppressed — long builds and deploys are an expected wait, not a hung session. |
 
 The stall monitor in `ProgressEdits` fires at 5 min (300s) idle, 10 min for local tools, 15 min for MCP tools, and 30 min for pending approvals. When a local tool is running and the child process is CPU-active, the first stall warning fires but repeat warnings are suppressed — they resume if CPU goes idle (indicating a genuinely stuck tool). The liveness watchdog in the subprocess layer fires at `liveness_timeout` with `/proc` diagnostics. When `stall_auto_kill` is enabled, auto-kill requires a triple safety gate: timeout exceeded + zero TCP connections + CPU ticks not increasing between snapshots.
+
+### `[loop]`
+
+Controls Untether's observation of Claude Code's session-scoped scheduling tools (`CronCreate`, `ScheduleWakeup`). Off by default — users opt in per chat via `/config → 🔁 Loop mode`. ([#289](https://github.com/littlebearapps/untether/issues/289))
+
+=== "toml"
+
+    ```toml
+    [loop]
+    enabled = false
+    inline_threshold_seconds = 300
+    redundancy_check_interval = 30
+    max_iterations = 20
+    max_total_duration_hours = 4
+    min_interval_seconds = 60
+    expiry_days = 7
+    ```
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `enabled` | bool | `false` | Global default for Loop mode. Per-chat override available via `/config → 🔁 Loop mode`. |
+| `inline_threshold_seconds` | int | `300` | `ScheduleWakeup` calls with `delaySeconds` ≤ this stay rendered live by the rc8 countdown — no Untether-side timer is registered. Long waits (above the threshold) get an Untether timer that survives subprocess exit. |
+| `redundancy_check_interval` | int | `30` | Seconds the fire path waits before retrying when the originating subprocess is still alive (race-avoidance gate). |
+| `max_iterations` | int | `20` | Runaway-safety cap on iteration count (NOT a cost cap). |
+| `max_total_duration_hours` | int | `4` | Runaway-safety cap on wall-clock duration (NOT a cost cap). |
+| `min_interval_seconds` | int | `60` | Minimum interval between fires (matches upstream cron floor). |
+| `expiry_days` | int | `7` | Auto-expire loops 7 days after creation (matches upstream's session-task expiry). |
+
+**Cost limits are NOT in `[loop]`** — they live in `[cost_budget]` and apply to loop fires automatically. See [Cost budgets](../how-to/cost-budgets.md) for setup.
+
+State is persisted to `active_loops.json` (sibling of your `untether.toml`) so loops survive restarts. The do-not-resume sentinel for `/cancel`-cancelled loops is persisted alongside.
 
 ### `[auto_continue]`
 
@@ -324,11 +381,15 @@ Runtime security knobs. Defaults are safe — operators only flip these when inv
     ```toml
     [security]
     env_audit = true
+    env_extra_allow = ["OP_SERVICE_ACCOUNT_TOKEN", "DOPPLER_TOKEN"]
+    env_extra_prefix_allow = ["VAULT_", "INFISICAL_"]
     ```
 
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
 | `env_audit` | bool | `true` | One-shot `/proc/<claude_pid>/environ` sample on first `system.init` ([#361](https://github.com/littlebearapps/untether/issues/361)). Emits `claude.env_audit.leaked_var` WARNING per non-allowlisted name observed (dedup per session per name). Reuses `utils/env_policy.is_allowed`. Linux-only — silently no-ops elsewhere or when /proc is unreadable. Set `false` to opt out (e.g. on hardened hosts where `/proc/<pid>/environ` reads are sensitive). The companion `env -i` wrap on Claude exec ([#361](https://github.com/littlebearapps/untether/issues/361)) is always on and not configurable. |
+| `env_extra_allow` | list[str] | `[]` | Per-deployment exact-match additions to the engine-subprocess env allowlist ([#409](https://github.com/littlebearapps/untether/issues/409)). Use for credential-manager tokens that aren't in the global defaults — e.g. `["OP_SERVICE_ACCOUNT_TOKEN", "DOPPLER_TOKEN", "INFISICAL_TOKEN"]`. Each entry must match `[A-Z_][A-Z0-9_]*` (uppercase, digits, underscore; cannot start with a digit). Empty / whitespace / lowercase entries are rejected at config-load time. Currently honoured by the Claude and Pi runners. The audit (`env_audit`) honours these too, so user-allowed names aren't false-flagged as leaks. Untether emits one `env_policy.user_extension` INFO log per process at first runner spawn so the addition is visible in journalctl. |
+| `env_extra_prefix_allow` | list[str] | `[]` | Like `env_extra_allow` but for name *prefixes* — convenient for credential-manager families where many vars share a prefix. Examples: `["VAULT_"]` admits `VAULT_TOKEN`, `VAULT_ADDR`, `VAULT_NAMESPACE`. Each entry must match the same env-var name shape as `env_extra_allow`. |
 
 ## Engine-specific config tables
 
@@ -363,6 +424,7 @@ here; plugin engines should document their own keys.
 |-----|------|---------|-------|
 | `model` | string | (unset) | Optional model override. |
 | `allowed_tools` | string[] | `["Bash", "Read", "Edit", "Write"]` | Auto-approve tool rules. |
+| `extra_args` | string[] | `[]` | Extra CLI args passed to `claude` (e.g. `["--chrome"]` to opt into the Claude-in-Chrome extension). Flags Untether manages internally (`-p`, `--print`, `--output-format`, `--input-format`, `--resume`/`-r`, `--continue`/`-c`, `--permission-mode`, `--permission-prompt-tool`) are rejected at config-load. |
 | `dangerously_skip_permissions` | bool | `false` | Skip Claude Code permissions prompts. |
 | `use_api_billing` | bool | `false` | Keep `ANTHROPIC_API_KEY` for API billing. |
 
@@ -371,6 +433,7 @@ here; plugin engines should document their own keys.
     ```sh
     untether config set claude.model "claude-sonnet-4-5-20250929"
     untether config set claude.allowed_tools '["Bash", "Read", "Edit", "Write"]'
+    untether config set claude.extra_args '["--chrome"]'
     untether config set claude.dangerously_skip_permissions false
     untether config set claude.use_api_billing false
     ```
@@ -381,6 +444,7 @@ here; plugin engines should document their own keys.
     [claude]
     model = "claude-sonnet-4-5-20250929"
     allowed_tools = ["Bash", "Read", "Edit", "Write"]
+    extra_args = ["--chrome"]    # e.g. opt into Claude-in-Chrome
     dangerously_skip_permissions = false
     use_api_billing = false
     ```
@@ -434,11 +498,13 @@ here; plugin engines should document their own keys.
 | Key | Type | Default | Notes |
 |-----|------|---------|-------|
 | `model` | string | (unset) | Optional model override, passed as `--model`. |
+| `skip_trust` | bool | `true` | Pass `--skip-trust` so headless runs work outside `~/.gemini/trustedFolders.json` ([#471](https://github.com/littlebearapps/untether/issues/471)). Gemini CLI rejects runs from any directory not in the trust list — even with `--approval-mode yolo` — and there is no interactive prompt path in headless usage. Set `false` to enforce Gemini's project-local extension/MCP trust gate. |
 
 === "untether config"
 
     ```sh
     untether config set gemini.model "gemini-2.5-pro"
+    untether config set gemini.skip_trust true
     ```
 
 === "toml"
@@ -446,6 +512,7 @@ here; plugin engines should document their own keys.
     ```toml
     [gemini]
     model = "gemini-2.5-pro"
+    skip_trust = true
     ```
 
 !!! note "Approval mode"
@@ -457,7 +524,7 @@ here; plugin engines should document their own keys.
 |-----|------|---------|-------|
 | `mode` | string | (unset) | Execution mode, passed as `--mode`. Values: `deep`, `free`, `rush`, `smart`. |
 | `model` | string | (unset) | Display label shown in the message footer. Overridden by `mode` if both are set. |
-| `dangerously_allow_all` | bool | `true` | Pass `--dangerously-allow-all` to skip permission prompts. |
+| `dangerously_allow_all` | bool | `false` | Pass `--dangerously-allow-all` to skip AMP's permission prompts. **Default flipped to `false` in v0.35.3** ([#206](https://github.com/littlebearapps/untether/issues/206)) — set to `true` only if you specifically want AMP runs without its built-in permission system. Untether's own permission layer (when configured) remains the primary control. |
 | `stream_json_input` | bool | `false` | Pass `--stream-json-input` for stdin-based prompt delivery. |
 
 === "untether config"

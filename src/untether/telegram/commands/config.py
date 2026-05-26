@@ -187,7 +187,7 @@ async def _page_home(ctx: CommandContext) -> None:
     current_engine, engine_label = await _resolve_effective_engine(ctx)
 
     pm_label = "—"
-    trigger_label = "all"
+    listen_label = "all"
     model_label = "default"
     reasoning_label = "default"
     aq_label = "default"
@@ -220,8 +220,8 @@ async def _page_home(ctx: CommandContext) -> None:
             else:
                 pm_label = "read-only"
 
-        trig = await prefs.get_trigger_mode(chat_id)
-        trigger_label = trig or "all"
+        listen = await prefs.get_listen_mode(chat_id)
+        listen_label = listen or "all"
 
         # Model override for current engine
         if engine_override and engine_override.model:
@@ -350,7 +350,25 @@ async def _page_home(ctx: CommandContext) -> None:
         engine_hint = _ENGINE_MODEL_HINTS.get(current_engine, "from CLI settings")
         model_hint = f"  · {engine_hint}"
     lines.append(f"Model: <b>{model_label}</b>{model_hint}")
-    lines.append(f"Trigger: <b>{trigger_label}</b>{_home_hint('tr', trigger_label)}")
+    lines.append(f"Listen: <b>{listen_label}</b>{_home_hint('tr', listen_label)}")
+    # #294: master trigger pause indicator on the home page when there's a
+    # trigger manager with configured crons/webhooks. Sits below the chat
+    # "Listen" line to keep the two senses of "trigger" visually distinct
+    # (cron/webhook system vs the renamed-from-trigger listen mode, #297).
+    triggers_indicator: str | None = None
+    triggers_paused = False
+    triggers_has_any = False
+    if ctx.trigger_manager is not None:
+        triggers_paused = ctx.trigger_manager.is_paused
+        triggers_has_any = (
+            len(ctx.trigger_manager.cron_ids()) > 0
+            or ctx.trigger_manager.webhook_count > 0
+        )
+        if triggers_has_any:
+            state = "⏸ paused" if triggers_paused else "active"
+            triggers_indicator = f"Triggers (cron/webhook): <b>{state}</b>"
+    if triggers_indicator is not None:
+        lines.append(triggers_indicator)
     if show_reasoning:
         home_rs_label = get_reasoning_label(current_engine)
         if reasoning_label == "default":
@@ -396,13 +414,18 @@ async def _page_home(ctx: CommandContext) -> None:
         )
         buttons.append(
             [
-                {"text": "📡 Trigger", "callback_data": "config:tr"},
-                {"text": "⚙️ Engine & model", "callback_data": "config:ag"},
+                {"text": "📡 Listen", "callback_data": "config:tr"},
+                {"text": "🔁 Loop mode", "callback_data": "config:loop"},
             ]
         )
         buttons.append(
             [
                 {"text": f"🧠 {home_rs_label}", "callback_data": "config:rs"},
+                {"text": "⚙️ Engine & model", "callback_data": "config:ag"},
+            ]
+        )
+        buttons.append(
+            [
                 {"text": "ℹ️ About", "callback_data": "config:ab"},
             ]
         )
@@ -420,7 +443,7 @@ async def _page_home(ctx: CommandContext) -> None:
         )
         buttons.append(
             [
-                {"text": "📡 Trigger", "callback_data": "config:tr"},
+                {"text": "📡 Listen", "callback_data": "config:tr"},
                 {"text": "⚙️ Engine & model", "callback_data": "config:ag"},
             ]
         )
@@ -446,7 +469,7 @@ async def _page_home(ctx: CommandContext) -> None:
         )
         buttons.append(
             [
-                {"text": "📡 Trigger", "callback_data": "config:tr"},
+                {"text": "📡 Listen", "callback_data": "config:tr"},
                 {"text": "⚙️ Engine & model", "callback_data": "config:ag"},
             ]
         )
@@ -464,11 +487,23 @@ async def _page_home(ctx: CommandContext) -> None:
                 {"text": "⚙️ Engine & model", "callback_data": "config:ag"},
             ]
         )
-        row3 = [{"text": "📡 Trigger", "callback_data": "config:tr"}]
+        row3 = [{"text": "📡 Listen", "callback_data": "config:tr"}]
         if show_reasoning:
             row3.append({"text": f"🧠 {home_rs_label}", "callback_data": "config:rs"})
         buttons.append(row3)
         buttons.append([{"text": "ℹ️ About", "callback_data": "config:ab"}])
+
+    # #294: master trigger pause toggle row — only when triggers are configured
+    # for this transport. Sits below the per-engine layout so it doesn't
+    # crowd the existing rows. Label reflects current state.
+    if triggers_has_any:
+        if triggers_paused:
+            tg_label = "▶️ Resume triggers"
+            tg_action = "config:tg:resume"
+        else:
+            tg_label = "⏸ Pause triggers"
+            tg_action = "config:tg:pause"
+        buttons.append([{"text": tg_label, "callback_data": tg_action}])
 
     await _respond(ctx, "\n".join(lines), buttons)
 
@@ -759,6 +794,137 @@ async def _page_planmode(ctx: CommandContext, action: str | None = None) -> None
 
 
 # ---------------------------------------------------------------------------
+# Loop mode (#289)
+# ---------------------------------------------------------------------------
+
+
+async def _page_loop(ctx: CommandContext, action: str | None = None) -> None:
+    """Loop mode toggle for /loop and ScheduleWakeup observation (#289).
+
+    Mirrors the shape of ``_page_planmode``: tri-state per-chat override
+    (on / off / clear → fall back to global ``[loop] enabled``), explicit
+    cost/quota warning before enabling, deeplink to ``/config:cu`` for
+    setting a budget cap.
+    """
+    from ..chat_prefs import ChatPrefsStore, resolve_prefs_path
+    from ..engine_overrides import LOOP_SUPPORTED_ENGINES, EngineOverrides
+
+    config_path = ctx.config_path
+    if config_path is None:
+        await _respond(
+            ctx,
+            "<b>🔁 Loop mode</b>\n\nUnavailable (no config path).",
+            [[{"text": "← Back", "callback_data": "config:home"}]],
+        )
+        return
+
+    prefs = ChatPrefsStore(resolve_prefs_path(config_path))
+    chat_id = ctx.message.channel_id
+
+    current_engine, _ = await _resolve_effective_engine(ctx)
+    if current_engine not in LOOP_SUPPORTED_ENGINES:
+        await _respond(
+            ctx,
+            (
+                "<b>🔁 Loop mode</b>\n\nOnly available for Claude Code — "
+                "other engines don't have <code>/loop</code> or "
+                "<code>ScheduleWakeup</code>."
+            ),
+            [[{"text": "← Back", "callback_data": "config:home"}]],
+        )
+        return
+
+    engine = current_engine
+
+    # Action handlers
+    if action in {"on", "off", "clr"}:
+        current = await prefs.get_engine_override(chat_id, engine)
+        if action == "on":
+            new_value: bool | None = True
+        elif action == "off":
+            new_value = False
+        else:
+            new_value = None
+        updated = EngineOverrides(
+            model=current.model if current else None,
+            reasoning=current.reasoning if current else None,
+            permission_mode=current.permission_mode if current else None,
+            ask_questions=current.ask_questions if current else None,
+            diff_preview=current.diff_preview if current else None,
+            show_api_cost=current.show_api_cost if current else None,
+            show_subscription_usage=current.show_subscription_usage
+            if current
+            else None,
+            show_resume_line=current.show_resume_line if current else None,
+            budget_enabled=current.budget_enabled if current else None,
+            budget_auto_cancel=current.budget_auto_cancel if current else None,
+            loop_enabled=new_value,
+        )
+        await prefs.set_engine_override(chat_id, engine, updated)
+        logger.info("config.loop.set", chat_id=chat_id, value=new_value)
+        await _page_home(ctx)
+        return
+
+    # Render — resolve current effective state
+    current = await prefs.get_engine_override(chat_id, engine)
+    per_chat = current.loop_enabled if current else None
+    if per_chat is None:
+        try:
+            from ...settings import load_settings_if_exists
+
+            result = load_settings_if_exists()
+            global_enabled = (
+                bool(result[0].loop.enabled) if result is not None else False
+            )
+        except Exception:  # noqa: BLE001
+            global_enabled = False
+        effective = "On (global)" if global_enabled else "Off (global)"
+    elif per_chat:
+        effective = "On (per-chat)"
+    else:
+        effective = "Off (per-chat)"
+
+    body = (
+        f"<b>🔁 Loop mode</b>\n\n"
+        f"Currently: <b>{effective}</b>\n\n"
+        f"When <b>ON</b>:\n"
+        f"  Claude Code can schedule and continue tasks autonomously.\n"
+        f"  <code>/loop 5m check the deploy</code> works end-to-end via "
+        f"Telegram — Untether observes Claude's CronCreate / "
+        f"ScheduleWakeup tool calls and re-fires each iteration when due, "
+        f"spawning a fresh <code>claude --resume</code> per fire.\n\n"
+        f"When <b>OFF</b> (default):\n"
+        f"  Claude Code only runs when you message it. <code>/loop</code> "
+        f"appears to register schedules during a turn, but nothing fires "
+        f"after the subprocess exits.\n\n"
+        f"⚠️ <b>Cost &amp; quota risk when ON</b>\n"
+        f"  Autonomous loops consume API credits or your Claude "
+        f"subscription quota. A 24h <code>/loop 1m</code> can fire up to "
+        f"1440 times. Set a budget in 💰 Cost &amp; usage <i>before</i> "
+        f"turning Loop mode on — the same daily cost cap applies to loop "
+        f"fires automatically."
+    )
+    buttons = [
+        [
+            {
+                "text": _check("On", active=per_chat is True),
+                "callback_data": "config:loop:on",
+            },
+            {
+                "text": _check("Off", active=per_chat is False),
+                "callback_data": "config:loop:off",
+            },
+        ],
+        [
+            {"text": "Clear override", "callback_data": "config:loop:clr"},
+            {"text": "💰 Set a budget", "callback_data": "config:cu"},
+        ],
+        [{"text": "← Back", "callback_data": "config:home"}],
+    ]
+    await _respond(ctx, body, buttons)
+
+
+# ---------------------------------------------------------------------------
 # Verbose
 # ---------------------------------------------------------------------------
 
@@ -923,7 +1089,8 @@ async def _page_engine(ctx: CommandContext, action: str | None = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Trigger mode
+# Listen mode (#297: renamed from "Trigger mode" to disambiguate from
+# webhook/cron triggers. Callback prefix `tr` kept for stable callback_data.)
 # ---------------------------------------------------------------------------
 
 
@@ -934,7 +1101,7 @@ async def _page_trigger(ctx: CommandContext, action: str | None = None) -> None:
     if config_path is None:
         await _respond(
             ctx,
-            "<b>📡 Trigger mode</b>\n\nUnavailable (no config path).",
+            "<b>📡 Listen mode</b>\n\nUnavailable (no config path).",
             [[{"text": "← Back", "callback_data": "config:home"}]],
         )
         return
@@ -943,26 +1110,26 @@ async def _page_trigger(ctx: CommandContext, action: str | None = None) -> None:
     chat_id = ctx.message.channel_id
 
     if action == "all":
-        await prefs.clear_trigger_mode(chat_id)
-        logger.info("config.trigger.set", chat_id=chat_id, mode="all")
+        await prefs.clear_listen_mode(chat_id)
+        logger.info("config.listen.set", chat_id=chat_id, mode="all")
         await _page_home(ctx)
         return
     elif action == "men":
-        await prefs.set_trigger_mode(chat_id, "mentions")
-        logger.info("config.trigger.set", chat_id=chat_id, mode="mentions")
+        await prefs.set_listen_mode(chat_id, "mentions")
+        logger.info("config.listen.set", chat_id=chat_id, mode="mentions")
         await _page_home(ctx)
         return
     elif action == "clr":
-        await prefs.clear_trigger_mode(chat_id)
-        logger.info("config.trigger.cleared", chat_id=chat_id)
+        await prefs.clear_listen_mode(chat_id)
+        logger.info("config.listen.cleared", chat_id=chat_id)
         await _page_home(ctx)
         return
 
-    current = await prefs.get_trigger_mode(chat_id)
+    current = await prefs.get_listen_mode(chat_id)
     current_label = current or "all"
 
     lines = [
-        "<b>📡 Trigger mode</b>",
+        "<b>📡 Listen mode</b>",
         "",
         "Control when the bot responds in group chats.",
         "",
@@ -1811,6 +1978,188 @@ async def _page_about(ctx: CommandContext, action: str | None = None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Triggers (cron + webhook) master pause toggle (#294) + per-chat detail (#271)
+# ---------------------------------------------------------------------------
+
+
+_TRIGGER_LIST_CAP = 10
+
+
+def _format_trigger_relative(ts: float | None) -> str:
+    """Render a unix timestamp as a relative-time hint for the triggers page.
+
+    Mirrors ``stats._format_last_run`` semantics so /config and /stats agree
+    on phrasing.
+    """
+    import time
+
+    if ts is None or ts <= 0:
+        return "never"
+    diff = time.time() - ts
+    if diff < 60:
+        return "just now"
+    if diff < 3600:
+        return f"{int(diff // 60)}m ago"
+    if diff < 86400:
+        return f"{int(diff // 3600)}h ago"
+    return f"{int(diff // 86400)}d ago"
+
+
+def _truncate_field(value: str | None, limit: int = 24) -> str:
+    if not value:
+        return "—"
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1] + "…"
+
+
+async def _page_triggers(ctx: CommandContext, action: str | None = None) -> None:
+    """Triggers control + per-chat visibility page.
+
+    Lives on its own ``/config`` page distinct from ``/config → 📡 Trigger``
+    (which is the listen-mode all/mentions chat-routing setting). Pause/resume
+    is the master kill-switch (#294). Below the controls, when triggers are
+    configured for the current chat, the page lists each cron and webhook
+    with its schedule/path, project, engine, and last-fired timestamp (#271
+    Tier 2 + Tier 3).
+    """
+    from ...triggers.describe import describe_cron
+    from ...triggers.history import get_last_fired
+
+    mgr = ctx.trigger_manager
+    chat_id = ctx.message.channel_id
+    chat_id_int = chat_id if isinstance(chat_id, int) else None
+
+    if mgr is None:
+        await _respond(
+            ctx,
+            "<b>⏰ Triggers</b>\n\nUnavailable (transport has no trigger support).",
+            [[{"text": "← Back", "callback_data": "config:home"}]],
+        )
+        return
+
+    cron_count = len(mgr.cron_ids())
+    webhook_count = mgr.webhook_count
+    has_any = cron_count > 0 or webhook_count > 0
+
+    if action == "pause" and has_any and mgr.pause():
+        logger.info(
+            "config.triggers.paused",
+            chat_id=chat_id_int,
+            crons=cron_count,
+            webhooks=webhook_count,
+        )
+    elif action == "resume" and mgr.resume():
+        logger.info(
+            "config.triggers.resumed",
+            chat_id=chat_id_int,
+            crons=cron_count,
+            webhooks=webhook_count,
+        )
+
+    is_paused = mgr.is_paused
+
+    lines = ["<b>⏰ Triggers</b>", ""]
+    if not has_any:
+        lines += [
+            "No crons or webhooks configured.",
+            "",
+            "Add <code>[[triggers.crons]]</code> or <code>[[triggers.webhooks]]</code> "
+            "entries to <code>untether.toml</code> — see the trigger docs.",
+        ]
+    else:
+        if is_paused:
+            lines += [
+                "Status: <b>⏸ paused</b>",
+                "",
+                "Crons and webhooks are temporarily suspended.",
+                f"<code>{cron_count}</code> cron · "
+                f"<code>{webhook_count}</code> webhook",
+                "",
+                "Pause is in-memory only — triggers auto-resume on restart.",
+            ]
+        else:
+            lines += [
+                "Status: <b>active</b>",
+                "",
+                f"<code>{cron_count}</code> cron · "
+                f"<code>{webhook_count}</code> webhook",
+            ]
+
+        # #271 Tier 2: per-chat trigger list. Only render when we can scope
+        # to the current chat — without chat_id we'd risk showing another
+        # group's triggers in a private chat.
+        if chat_id_int is not None:
+            default_tz = mgr.default_timezone
+            chat_crons = mgr.crons_for_chat(
+                chat_id_int, default_chat_id=ctx.default_chat_id
+            )
+            chat_webhooks = mgr.webhooks_for_chat(
+                chat_id_int, default_chat_id=ctx.default_chat_id
+            )
+
+            if chat_crons:
+                lines += ["", "<b>Crons</b>"]
+                for cron in chat_crons[:_TRIGGER_LIST_CAP]:
+                    schedule_text = describe_cron(
+                        cron.schedule, cron.timezone or default_tz
+                    )
+                    last = _format_trigger_relative(get_last_fired(cron.id))
+                    lines.append(
+                        f"<code>{cron.id}</code> · {schedule_text} · "
+                        f"proj=<i>{_truncate_field(cron.project)}</i> · "
+                        f"eng=<i>{_truncate_field(cron.engine)}</i> · "
+                        f"last <i>{last}</i>"
+                    )
+                overflow = len(chat_crons) - _TRIGGER_LIST_CAP
+                if overflow > 0:
+                    lines.append(
+                        f"…and {overflow} more (see <code>untether.toml</code>)"
+                    )
+
+            if chat_webhooks:
+                lines += ["", "<b>Webhooks</b>"]
+                for wh in chat_webhooks[:_TRIGGER_LIST_CAP]:
+                    last = _format_trigger_relative(get_last_fired(wh.id))
+                    lines.append(
+                        f"<code>{wh.id}</code> · <code>{wh.path}</code> · "
+                        f"auth=<i>{wh.auth}</i> · "
+                        f"proj=<i>{_truncate_field(wh.project)}</i> · "
+                        f"eng=<i>{_truncate_field(wh.engine)}</i> · "
+                        f"last <i>{last}</i>"
+                    )
+                overflow = len(chat_webhooks) - _TRIGGER_LIST_CAP
+                if overflow > 0:
+                    lines.append(
+                        f"…and {overflow} more (see <code>untether.toml</code>)"
+                    )
+
+    buttons: list[list[dict[str, str]]] = []
+    if has_any:
+        if is_paused:
+            buttons.append(
+                [
+                    {
+                        "text": "▶️ Resume triggers",
+                        "callback_data": "config:tg:resume",
+                    }
+                ]
+            )
+        else:
+            buttons.append(
+                [
+                    {
+                        "text": "⏸ Pause triggers",
+                        "callback_data": "config:tg:pause",
+                    }
+                ]
+            )
+    buttons.append([{"text": "← Back", "callback_data": "config:home"}])
+
+    await _respond(ctx, "\n".join(lines), buttons)
+
+
+# ---------------------------------------------------------------------------
 # Routing
 # ---------------------------------------------------------------------------
 
@@ -1819,6 +2168,7 @@ _PAGES: dict[str, object] = {
     "vb": _page_verbose,
     "ag": _page_engine,
     "tr": _page_trigger,
+    "tg": _page_triggers,
     "md": _page_model,
     "rs": _page_reasoning,
     "aq": _page_ask_questions,
@@ -1826,6 +2176,7 @@ _PAGES: dict[str, object] = {
     "cu": _page_cost_usage,
     "rl": _page_resume_line,
     "ab": _page_about,
+    "loop": _page_loop,
 }
 
 
@@ -1865,9 +2216,13 @@ class ConfigCommand:
             },
             "ag": {"clr": "Engine: cleared", "md_clr": "Model: cleared"},
             "tr": {
-                "all": "Trigger: all",
-                "men": "Trigger: mentions",
-                "clr": "Trigger: cleared",
+                "all": "Listen: all",
+                "men": "Listen: mentions",
+                "clr": "Listen: cleared",
+            },
+            "tg": {
+                "pause": "⏸ Triggers paused",
+                "resume": "▶️ Triggers resumed",
             },
             "md": {"clr": "Model: cleared"},
             "rs": {
@@ -1907,6 +2262,11 @@ class ConfigCommand:
                 "on": "Resume line: on",
                 "off": "Resume line: off",
                 "clr": "Resume line: cleared",
+            },
+            "loop": {
+                "on": "🔁 Loop mode: on",
+                "off": "🔁 Loop mode: off",
+                "clr": "🔁 Loop mode: cleared",
             },
         }
         page_labels = _TOAST_LABELS.get(page, {})

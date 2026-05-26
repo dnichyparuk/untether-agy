@@ -79,6 +79,9 @@ npm install -g @google/gemini-cli
 
 Gemini CLI uses Google AI Studio or Vertex AI for authentication. Run `gemini` and sign in with your Google account. Supports plan mode, sandboxing, and automatic model routing (Pro for planning, Flash for implementation).
 
+!!! tip "Headless trust"
+    Untether runs Gemini with `--skip-trust` by default (v0.35.3+, [#471](https://github.com/littlebearapps/untether/issues/471)) so projects outside `~/.gemini/trustedFolders.json` work in headless mode. Set `[gemini] skip_trust = false` in `untether.toml` if you'd rather enforce Gemini's project-local trust gate.
+
 ### AMP
 
 ```sh
@@ -135,13 +138,13 @@ section and profile picture for your bot, see /help for a
 list of commands.
 
 Use this token to access the HTTP API:
-123456789:ABCdefGHIjklMNOpqrsTUVwxyz
+<BOT_ID>:<BOT_TOKEN>
 
 Keep your token secure and store it safely, it can be used
 by anyone to control your bot.
 ```
 
-Copy the token (the `123456789:ABC...` part).
+Copy the token (the `<BOT_ID>:<BOT_TOKEN>` part).
 
 <!-- TODO: capture screenshot -->
 <!-- <img src="../assets/screenshots/botfather-newbot.jpg" alt="BotFather /newbot flow showing the generated token" width="360" loading="lazy" /> -->
@@ -328,7 +331,7 @@ Untether is now running and listening for messages!
 
 ## What just happened
 
-Your config file lives at `~/.untether/untether.toml`. The exact contents depend on your workflow choice:
+Your config file lives at `~/.untether/untether.toml`. The onboarding wizard populates the required fields including `allowed_user_ids` (your Telegram user ID — required as of v0.35.3, [#377](https://github.com/littlebearapps/untether/issues/377)). The exact contents depend on your workflow choice:
 
 === "assistant"
 
@@ -354,6 +357,7 @@ Your config file lives at `~/.untether/untether.toml`. The exact contents depend
         [transports.telegram]
         bot_token = "..."
         chat_id = 123456789
+        allowed_user_ids = [123456789]  # your Telegram user ID — required (#377)
         session_mode = "chat"       # auto-resume
         show_resume_line = false    # cleaner chat
 
@@ -386,6 +390,7 @@ Your config file lives at `~/.untether/untether.toml`. The exact contents depend
         [transports.telegram]
         bot_token = "..."
         chat_id = -1001234567890    # forum group
+        allowed_user_ids = [123456789, 234567890]  # required (#377) — list each teammate's Telegram user ID
         session_mode = "chat"
         show_resume_line = false
 
@@ -418,6 +423,7 @@ Your config file lives at `~/.untether/untether.toml`. The exact contents depend
         [transports.telegram]
         bot_token = "..."
         chat_id = 123456789
+        allowed_user_ids = [123456789]  # your Telegram user ID — required (#377)
         session_mode = "stateless"  # reply-to-continue
         show_resume_line = true     # always show resume lines
 

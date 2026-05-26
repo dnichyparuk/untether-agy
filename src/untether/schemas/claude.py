@@ -32,12 +32,49 @@ class StreamToolResultBlock(
     msgspec.Struct, tag="tool_result", tag_field="type", forbid_unknown_fields=False
 ):
     tool_use_id: str
-    content: str | list[dict[str, Any]] | None = None
+    # #501 — Claude Code may emit `content` as a single content block
+    # object (e.g. {"type": "text", "text": "..."}) in addition to the
+    # documented str / list[dict] / null shapes. _normalize_tool_result
+    # already handles dict; the schema must accept it too or msgspec
+    # raises ValidationError and the line is silently dropped.
+    content: str | dict[str, Any] | list[dict[str, Any]] | None = None
+    is_error: bool | None = None
+
+
+# #489 — Anthropic server-side tools (web_search, code_execution, computer_use, …)
+# emit `server_tool_use` content blocks. Structurally identical to `tool_use`.
+class StreamServerToolUseBlock(
+    msgspec.Struct,
+    tag="server_tool_use",
+    tag_field="type",
+    forbid_unknown_fields=False,
+):
+    id: str
+    name: str
+    input: dict[str, Any]
+
+
+# #489 — Result of the parent agent's `advisor()` meta-tool. Structurally identical
+# to `tool_result`.
+class StreamAdvisorToolResultBlock(
+    msgspec.Struct,
+    tag="advisor_tool_result",
+    tag_field="type",
+    forbid_unknown_fields=False,
+):
+    tool_use_id: str
+    # #501 — see StreamToolResultBlock.content note.
+    content: str | dict[str, Any] | list[dict[str, Any]] | None = None
     is_error: bool | None = None
 
 
 type StreamContentBlock = (
-    StreamTextBlock | StreamThinkingBlock | StreamToolUseBlock | StreamToolResultBlock
+    StreamTextBlock
+    | StreamThinkingBlock
+    | StreamToolUseBlock
+    | StreamToolResultBlock
+    | StreamServerToolUseBlock
+    | StreamAdvisorToolResultBlock
 )
 
 

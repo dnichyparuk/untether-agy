@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from ...commands import CommandBackend, CommandContext, CommandResult
 from ...logging import get_logger
-from ...transport import RenderedMessage
+from ...transport import MessageRef, RenderedMessage, SendOptions, Transport
+
+if TYPE_CHECKING:
+    from ...runners.claude import AskQuestionState
 
 logger = get_logger(__name__)
 
@@ -12,6 +17,47 @@ _EARLY_TOASTS: dict[str, str] = {
     "opt": "Selected",
     "other": "Type your reply...",
 }
+
+
+async def send_next_ask_question_message(
+    transport: Transport,
+    *,
+    chat_id: int,
+    user_msg_id: int,
+    thread_id: int | None,
+    flow: AskQuestionState,
+    notify: bool = True,
+) -> None:
+    """Send the next question in a multi-question AskUserQuestion flow.
+
+    Used by the text-reply continuation path (after the user clicks "Other"
+    and types an answer). The callback-button path edits the existing message
+    in-place via ``ctx.executor.edit`` instead.
+
+    Regression: prior to #488 the loop dispatcher constructed the
+    ``RenderedMessage`` correctly but passed it to ``send_plain`` which
+    expects a ``str``, causing a ``TypeError`` and crashing the whole
+    Untether process.
+    """
+    from ...runners.claude import format_question_message, get_question_option_buttons
+
+    msg_text = format_question_message(flow)
+    buttons = get_question_option_buttons(flow)
+    await transport.send(
+        channel_id=chat_id,
+        message=RenderedMessage(
+            text=msg_text,
+            extra={
+                "parse_mode": "HTML",
+                "reply_markup": {"inline_keyboard": buttons},
+            },
+        ),
+        options=SendOptions(
+            reply_to=MessageRef(channel_id=chat_id, message_id=user_msg_id),
+            notify=notify,
+            thread_id=thread_id,
+        ),
+    )
 
 
 class AskQuestionCommand:
@@ -92,6 +138,29 @@ class AskQuestionCommand:
                 # All questions answered — send structured response
                 success = await answer_ask_question_with_options(flow.request_id)
                 if success:
+                    # Strip the inline keyboard from the final question message
+                    # so the user can no longer click buttons that would fire
+                    # `ask_question.flow_missing` warnings. We use a short
+                    # completion text because `flow.current_index` is now past
+                    # the end of `flow.questions` (so `format_question_message`
+                    # would IndexError) and `MessageRef` does not carry the
+                    # original text.
+                    cleared = RenderedMessage(
+                        text="✅ All questions answered",
+                        extra={
+                            "parse_mode": "HTML",
+                            "reply_markup": {"inline_keyboard": []},
+                        },
+                    )
+                    try:
+                        await ctx.executor.edit(ctx.message, cleared)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "ask_question.keyboard_clear_failed",
+                            request_id=flow.request_id,
+                            error=str(exc),
+                        )
+
                     answer_lines = []
                     for question, answer in flow.answers.items():
                         answer_lines.append(f"Q: {question}\nA: {answer}")
@@ -100,6 +169,7 @@ class AskQuestionCommand:
                         text=f"Answers sent:\n\n{answers_summary}",
                         notify=True,
                     )
+                # Preserve buttons on failure so the user can retry.
                 return CommandResult(
                     text="Failed to send answers — session may have ended",
                     notify=True,

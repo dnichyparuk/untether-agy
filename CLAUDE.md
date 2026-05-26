@@ -13,6 +13,7 @@ Untether adds interactive permission control, plan mode support, and several UX 
 - **Pause & Outline Plan** — third button on plan approval; after Claude writes the outline, Approve/Deny/Let's discuss buttons appear automatically (hold-open keeps session alive while user reads)
 - **Agent context preamble** — configurable prompt preamble tells agents they're on Telegram and requests structured end-of-task summaries; `[preamble]` config section
 - **`/planmode`** — toggle permission mode per chat (on/off/auto)
+- **`/listen`** — set listen mode (`all` / `mentions`) per chat or topic; controls when the bot responds in groups; renamed from `/trigger` in v0.35.3 (#297) to disambiguate from webhook/cron triggers — `/trigger` still works as a deprecated alias for one release cycle
 - **Ask mode** — interactive AskUserQuestion with option buttons, sequential multi-question flows, and `/config` toggle; Claude-only
 - **Early callback answering** — clears button spinners immediately instead of waiting for processing
 - **Approval push notifications** — separate notify message when approval buttons appear
@@ -47,6 +48,8 @@ Untether adds interactive permission control, plan mode support, and several UX 
 - **Trigger visibility (Tier 1)** — `/ping` shows per-chat trigger summary (`⏰ triggers: 1 cron (id, 9:00 AM daily (Melbourne))`); run footer shows `⏰ cron:<id>` / `⚡ webhook:<id>` for trigger-initiated runs; new `describe_cron()` utility renders common patterns in plain English
 - **Graceful restart improvements (Tier 1)** — persists Telegram `update_id` to `last_update_id.json` so restarts don't drop/duplicate messages; `Type=notify` systemd integration via stdlib `sd_notify` (`READY=1` + `STOPPING=1`); `RestartSec=2`
 - **`diff_preview` plan bypass (#283)** — after user approves a plan outline via "Pause & Outline Plan", the `_discuss_approved` flag short-circuits diff preview for subsequent Edit/Write tools so no second approval is needed
+- **User-extensible env allowlist (#409)** — `[security] env_extra_allow` and `env_extra_prefix_allow` (in `untether.toml`) extend the engine-subprocess env allowlist with per-deployment names so users can thread credential-manager tokens (1Password, Doppler, Vault, Infisical, …) without forking `utils/env_policy.py`. Names are validated against `[A-Z_][A-Z0-9_]*`. Honoured by the Claude and Pi runners and by the `env_audit` probe. `BWS_ACCESS_TOKEN` was promoted into the built-in defaults at the same time. One `env_policy.user_extension` INFO log per process
+- **Master trigger pause toggle (#294)** — `TriggerManager.pause()` / `resume()` / `is_paused` gate cron firing and webhook dispatch globally; webhook server returns `503 triggers paused` (with `Retry-After: 60`); `/health` endpoint reflects paused state. Wired into `/config` two ways: home-page button row (only when triggers configured) and a dedicated `📡 Triggers` page (`config:tg`) showing counts + Pause/Resume button. `/ping` switches to `⏸ triggers paused: … (suspended)` while paused. Pause is in-memory only — restart auto-resumes (safe default)
 
 See `.claude/skills/claude-stream-json/` and `.claude/rules/control-channel.md` for implementation details.
 
@@ -84,6 +87,8 @@ Telegram <-> TelegramPresenter <-> RunnerBridge <-> Runner (claude/codex/opencod
 | `commands/config.py` | `/config` inline settings menu |
 | `commands/ask_question.py` | AskUserQuestion option button handler |
 | `commands/topics.py` | `/new`, `/ctx`, `/topic` commands; `_cancel_chat_tasks()` helper |
+| `commands/listen.py` | `/listen` command (listen-mode toggle); `/trigger` deprecated alias (#297) |
+| `listen_mode.py` | `resolve_listen_mode()` and `should_trigger_run()` for response gating |
 | `utils/proc_diag.py` | `/proc` process diagnostics for stall analysis (CPU, RSS, TCP, FDs, children) |
 | `shutdown.py` | Graceful shutdown state and drain logic |
 | `telegram/bridge.py` | Telegram message rendering |
@@ -156,8 +161,9 @@ Project hooks in `.claude/hooks.json` fire automatically:
 | Hook | Trigger | What it does |
 |------|---------|-------------|
 | release-guard | Bash: `git push`, `git tag`, `gh pr merge`, `gh release` | Blocks pushes to master/main, tag creation, PR merging, releases; allows feature and dev branch pushes |
-| release-guard-protect | Edit/Write to guard scripts or `hooks.json` | Prevents modification of release guard infrastructure |
+| release-guard-protect | Edit/Write to guard scripts, `hooks.json`, or `help-faq-protect.sh` | Prevents modification of release guard infrastructure and the FAQ-protect hook |
 | release-guard-mcp | GitHub MCP write tools | Blocks `merge_pull_request` and writes to master/main; allows feature branches |
+| help-faq-protect | Bash: `rm`, `git rm`, `mv`, `>` redirect targeting `docs/faq/faq.md` | Blocks deletion / move / truncate of the help-centre FAQ; edits via Edit/Write/append `>>` are allowed (#477, #483) |
 | dev-workflow-guard | `systemctl` with `untether` | Blocks staging restarts during dev; guides to `untether-dev`; allows `staging.sh`/`pipx upgrade` path |
 | runner-edit-context | Edit/Write to `runners/*.py` | 3-event contract, PTY lifecycle, test/doc reminders |
 | schema-edit-context | Edit/Write to `schemas/*.py` | msgspec impact on parsing, fixture updates |
@@ -177,6 +183,7 @@ Rules in `.claude/rules/` auto-load when editing matching files:
 | `release-discipline.md` | `CHANGELOG.md`, `pyproject.toml` | GitHub issue linking, changelog format, semantic versioning |
 | `dev-workflow.md` | `src/untether/**` | Dev vs staging separation, never restart staging for testing, always use untether-dev |
 | `context-quality.md` | AI context files (`CLAUDE.md`, `AGENTS.md`, etc.) | Cross-file consistency, path verification, version accuracy, command accuracy |
+| `help-faq.md` | `docs/faq/**` | NEVER delete; keep FAQ current with feature changes; H2s must be question-shaped (#477) |
 
 ## Tests
 
@@ -200,7 +207,7 @@ Key test files:
 - `test_cooldown_bypass.py` — 21 tests: outline bypass, rapid retry auto-deny, no-text auto-deny, cooldown escalation, hold-open outline flow
 - `test_verbose_progress.py` — 21 tests: format_verbose_detail() for each tool type, MarkdownFormatter verbose mode, compact regression
 - `test_verbose_command.py` — 7 tests: /verbose toggle on/off/clear, backend id
-- `test_config_command.py` — 218 tests: home page, plan mode/ask mode/verbose/engine/trigger/model/reasoning sub-pages, toggle actions, callback vs command routing, button layout, engine-aware visibility, default resolution
+- `test_config_command.py` — 221 tests: home page, plan mode/ask mode/verbose/engine/listen/model/reasoning sub-pages, toggle actions, callback vs command routing, button layout, engine-aware visibility, default resolution
 - `test_pi_compaction.py` — 6 tests: compaction start/end, aborted, no tokens, sequence
 - `test_proc_diag.py` — 24 tests: format_diag, is_cpu_active, collect_proc_diag (Linux /proc reads), ProcessDiag defaults
 - `test_exec_runner.py` — 22 tests: event tracking (event_count, recent_events ring buffer, PID in StartedEvent meta), JsonlStreamState defaults
@@ -239,12 +246,12 @@ Two instances run on lba-1 — staging (PyPI/TestPyPI) and dev (local editable s
 ### 3-phase release workflow (MANDATORY)
 
 1. **Dev** — fix code, run unit tests, test via `@untether_dev_bot` (6 engine chats), run integration tests
-2. **Staging** — bump to `X.Y.ZrcN`, merge feature branches to `dev` → CI publishes to TestPyPI, install on `@hetz_lba1_bot` via `scripts/staging.sh`, Nathan dogfoods for 1+ week
-3. **Release** — bump to `X.Y.Z`, write changelog, PR from `dev` → `master`, tag `vX.Y.Z` on master — `release.yml` publishes to PyPI (requires Nathan's approval in GitHub Actions UI)
+2. **Fleet rollout (rc)** — bump to `X.Y.ZrcN`, merge feature branches to `dev` → CI publishes to TestPyPI, attest tests via `scripts/run-integration-tests.sh ${VERSION} --manual`, then `scripts/fleet-rollout.sh ${VERSION}` rolls the rc to all 4 hosts (lba-1 staging + nsd VPS + channelo VPS + Mac) in parallel
+3. **Release** — bump to `X.Y.Z`, write changelog, PR from `dev` → `master`. After merge, `scripts/fleet-rollout.sh ${VERSION}` rolls the stable PyPI build to all 4 hosts in parallel. `release.yml` publishes to PyPI automatically; the master PR merge IS the approval.
 
 **Branch model:** `feature/*` → PR → `dev` (TestPyPI) → PR → `master` (PyPI). Master always matches the latest PyPI release.
 
-**NEVER skip staging for minor/major releases. NEVER go directly from dev to PyPI tagging.**
+**NEVER skip integration testing for minor/major releases. NEVER skip the attestation gate.** `fleet-rollout.sh` enforces the gate — no production upgrades without a passing `@untether_dev_bot` test run on file.
 
 **Claude Code's role in each phase:**
 - **Dev**: edit code, run tests, push feature branches, create PRs to `dev`, run integration tests via Telegram MCP
@@ -297,9 +304,15 @@ No further manual approval is needed. The PR merge IS the release approval. Pre-
 systemctl --user restart untether-dev
 journalctl --user -u untether-dev -f
 
-# Staging: install rc from TestPyPI for dogfooding
+# Single-host staging (lba-1 only — legacy single-bot path)
 scripts/staging.sh install X.Y.ZrcN
 systemctl --user restart untether
+
+# Fleet rollout to all 4 hosts (lba-1 + nsd + channelo + mac)
+scripts/run-integration-tests.sh X.Y.ZrcN --manual    # attest via @untether_dev_bot
+scripts/fleet-rollout.sh X.Y.ZrcN                     # parallel upgrade
+scripts/fleet-rollout.sh X.Y.ZrcN --dry-run           # preview
+scripts/fleet-rollback.sh X.Y.(Z-1) --only mac        # revert one host
 
 # Promote to stable (only after PyPI release)
 scripts/staging.sh reset && systemctl --user restart untether
@@ -308,6 +321,9 @@ scripts/staging.sh reset && systemctl --user restart untether
 uv run pytest
 uv run ruff check src/
 ```
+
+See `.claude/rules/release-discipline.md` ("Fleet rollout (rc and stable)") and
+`docs/plans/2026-05-13-fleet-monitoring-and-upgrades.md` for the full design.
 
 ## CI Pipeline
 
@@ -344,7 +360,8 @@ Release pipeline (`release.yml`) uses PyPI trusted publishing with OIDC. The `py
 Every bug fix and significant change MUST have a GitHub issue:
 - **Bugs found during debugging**: create an issue before or alongside the fix
 - **Issue body**: description, impact, affected files, fix reference
-- **Labels**: `bug`, `enhancement`, `documentation` as appropriate
+- **Labels**: `bug`, `enhancement`, `documentation` as appropriate; severity on bugs via `severity:critical|major|minor|trivial`; `priority: low|medium|high` (note space) for human triage
+- **Auto-filed sources**: `auto:error-report` (untether-issue-watcher daemon, log-pattern errors — runs on lba-1, nsd, channelo, mac; each filing is host-tagged via the `HOST` env in the daemon's unit/plist) and `auto:monitor-audit` (`/monitor` command audit loop, bugs + enhancements — 4 per-host configs plus the `untether-fleet` meta-target for cross-host audits)
 - **Closing**: reference the fixing PR or commit in a close comment
 
 ### Changelog
@@ -373,6 +390,12 @@ Before tagging a release:
 ## Documentation screenshots
 
 48 screenshots in `docs/assets/screenshots/` with a tracking checklist in `CAPTURES.md`. README uses a composite hero collage (`hero-collage.jpg`) built with ImageMagick for mobile responsiveness. Doc files use HTML `<img>` tags with `width="360"` and `loading="lazy"` (works in both GitHub and MkDocs). 14 screenshots are still missing and commented out with `<!-- TODO: capture screenshot -->` markers.
+
+## Help-centre FAQ
+
+`docs/faq/faq.md` (12 H2 question-shaped Q/A pairs; renamed from `docs/faq/index.md` in #483 so the help-centre URL becomes `/help/untether/faq/`) backs the marketing-site **FAQPage Schema.org** pipeline shipped on `feature/help-seo-geo-items-1-4` in [`littlebearapps/littlebearapps.com`](https://github.com/littlebearapps/littlebearapps.com). Once the docs-sync mapping in `scripts/docs-sync.config.ts` registers `untether → docs/faq → category: faq`, the marketing site emits `<script type="application/ld+json">` `FAQPage` JSON-LD on every help-centre deploy, unlocking AI-citation surface (ChatGPT, Perplexity, Google AI Overviews) and SERP rich-snippet eligibility.
+
+**The file MUST NOT be deleted or moved** — that silently breaks the docs-sync mapping and regresses the schema on the next deploy. The repo enforces this via the `help-faq-protect.sh` Bash hook which blocks `rm`, `git rm`, `mv`-away, and shell `>` truncation. **Edits ARE encouraged**: keep the FAQ in sync with new features as they land in `CHANGELOG.md`. See [`.claude/rules/help-faq.md`](.claude/rules/help-faq.md) for the full update cadence and shape rules. Tracking issues: [#477](https://github.com/littlebearapps/untether/issues/477) (creation), [#483](https://github.com/littlebearapps/untether/issues/483) (URL rename).
 
 ## Conventions
 
