@@ -56,6 +56,11 @@ logger = get_logger(__name__)
 
 _ID_RE = re.compile(ID_PATTERN)
 
+# Maximum project-alias length, matching the ``{1,32}`` bound baked into
+# :data:`untether.ids.ID_PATTERN`. Kept as a named constant so the alias
+# truncation and dedup-suffix arithmetic in :func:`derive_alias` stay in sync.
+_MAX_ALIAS_LENGTH = 32
+
 # A path segment (owner or repo name) must not contain a slash (that would
 # smuggle extra path components past the regex split) and must otherwise
 # look like a normal GitHub-style segment: letters, digits, dot, underscore,
@@ -147,7 +152,7 @@ def derive_alias(ref: RepoRef, existing: set[str]) -> str:
     """
     lowered = ref.repo.lower()
     sanitised = re.sub(r"[^a-z0-9_]", "_", lowered)
-    sanitised = sanitised.strip("_")[:32]
+    sanitised = sanitised.strip("_")[:_MAX_ALIAS_LENGTH]
     base = sanitised or "repo"
     if not _ID_RE.fullmatch(base):
         base = "repo"
@@ -158,7 +163,7 @@ def derive_alias(ref: RepoRef, existing: set[str]) -> str:
     n = 1
     while True:
         suffix = f"_{n}"
-        alias = f"{base[: 32 - len(suffix)]}{suffix}"
+        alias = f"{base[: _MAX_ALIAS_LENGTH - len(suffix)]}{suffix}"
         if alias not in existing and _ID_RE.fullmatch(alias):
             return alias
         n += 1
@@ -495,7 +500,16 @@ async def handle_clone_command(
 
     await reply(text=f"cloning `{ref.owner}/{ref.repo}`...")
 
-    outcome = await run_git_clone(ref, dest, branch=branch, depth=clone_cfg.depth)
+    try:
+        outcome = await run_git_clone(ref, dest, branch=branch, depth=clone_cfg.depth)
+    except OSError as exc:
+        # e.g. the `git` binary is missing (FileNotFoundError) or the spawn
+        # otherwise fails at the OS level. run_git_clone converts a non-zero
+        # exit or timeout into an ``ok=False`` outcome, but a failure to spawn
+        # the subprocess at all raises OSError — catch it here so /clone
+        # replies gracefully instead of crashing the handler task.
+        await reply(text=f"git clone failed: {exc}")
+        return
     if not outcome.ok:
         await reply(text=f"git clone failed:\n{outcome.stderr_excerpt}")
         return
@@ -510,6 +524,13 @@ async def handle_clone_command(
         )
     except ConfigError as exc:
         await reply(text=f"cloned to {dest} but failed to register project: {exc}")
+        return
+    except OSError as exc:
+        # read_config/write_config touch the filesystem; an IO error (e.g.
+        # permission denied, disk full) surfaces as OSError rather than
+        # ConfigError. Reply gracefully — the clone already succeeded, so
+        # this is a register-only failure, not a handler crash.
+        await reply(text=f"cloned to {dest} but failed to write config: {exc}")
         return
 
     # TOPIC STEP — gated; best-effort; never hard-fails the command.

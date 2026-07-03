@@ -160,6 +160,13 @@ class TelegramBridgeConfig:
     the projects table at startup and is not exposed via the transport
     settings hot-reload path. Use :meth:`update_from` to apply reloaded
     transport settings.
+
+    ``clone`` (the ``[clone]`` command settings) is not a transport-settings
+    field, so it is outside :meth:`update_from`; it is instead hot-reloaded
+    by a dedicated branch in ``telegram/loop.py``'s ``handle_reload`` (direct
+    reassignment, mirroring the ``[triggers]`` precedent) since ``[clone]``
+    lives on the top-level ``UntetherSettings`` rather than under
+    ``[transports.telegram]``.
     """
 
     bot: BotClient
