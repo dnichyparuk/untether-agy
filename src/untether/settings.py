@@ -383,6 +383,14 @@ class CloneSettings(BaseModel):
     hosts ``parse_repo_url``/``host_is_allowed`` (see
     ``telegram/clone.py``) will accept for both the https and scp-style
     (``git@host:owner/repo``) URL forms.
+
+    ``default_engine`` seeds the ``default_engine`` field written into the new
+    ``[projects.<alias>]`` block at clone time. It defaults to ``None``, which
+    means "don't pin an engine" — the cloned project (and its bound topic)
+    then inherits the currently configured global ``default_engine`` via the
+    normal resolution chain (see ``telegram/engine_defaults.py``). Set it
+    explicitly here only to force every clone onto a specific engine
+    regardless of the global default.
     """
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
@@ -390,7 +398,7 @@ class CloneSettings(BaseModel):
     enabled: bool = True
     root: NonEmptyStr = "~/untether-projects"
     allowed_hosts: list[NonEmptyStr] = Field(default_factory=lambda: ["github.com"])
-    default_engine: NonEmptyStr = "claude"
+    default_engine: NonEmptyStr | None = None
     depth: int = Field(default=1, ge=1)
 
 
