@@ -312,6 +312,62 @@ async def _notify_reload_applied(
     )
 
 
+async def _run_clone_command_tracked(
+    cfg: TelegramBridgeConfig,
+    msg: TelegramIncomingMessage,
+    args_text: str,
+    topic_store: TopicStateStore | None,
+    *,
+    running_tasks: RunningTasks | None,
+    resolved_scope: str | None,
+    scope_chat_ids: frozenset[int],
+) -> None:
+    """Run ``/clone`` registered in *running_tasks* for its full duration.
+
+    ``/clone`` runs a ``git clone`` subprocess (up to a 120s backstop
+    timeout) followed by a ``[projects.<alias>]`` config write. Unlike
+    agent runs it has no live progress message to key a
+    :class:`~untether.runner_bridge.RunningTask` entry on, so the incoming
+    command message doubles as the :class:`~untether.transport.MessageRef`.
+    Registering it here (mirroring how agent runs register themselves in
+    ``runner_bridge.handle_message``) lets ``_cancel_chat_tasks()`` (``/new``)
+    see the in-flight clone and lets ``_drain_and_exit()`` wait for it
+    instead of hard-cancelling it mid-clone/mid-write during a graceful
+    restart.
+
+    A user can also reply directly to the ``/clone`` command message while
+    it's running; ``ResumeResolver.resolve()`` looks up *running_tasks* by
+    the replied-to :class:`~untether.transport.MessageRef` for ANY entry
+    (agent or not) and spawns ``send_with_resume``, which blocks on
+    ``running_task.resume_ready``/``running_task.done``. A plain
+    ``RunningTask()`` never sets ``resume_ready`` (clone has no resume
+    token), so ``done`` is set in the ``finally`` below to unblock that
+    waiter with ``resume=None`` (it falls back to a "not ready yet" reply)
+    instead of hanging until process shutdown.
+    """
+    ref = MessageRef(channel_id=msg.chat_id, message_id=msg.message_id)
+    running_task = None
+    if running_tasks is not None:
+        from ..runner_bridge import RunningTask
+
+        running_task = RunningTask()
+        running_tasks[ref] = running_task
+    try:
+        await handle_clone_command(
+            cfg,
+            msg,
+            args_text,
+            topic_store,
+            resolved_scope=resolved_scope,
+            scope_chat_ids=scope_chat_ids,
+        )
+    finally:
+        if running_tasks is not None:
+            running_tasks.pop(ref, None)
+        if running_task is not None:
+            running_task.done.set()
+
+
 def _dispatch_builtin_command(
     *,
     ctx: TelegramCommandContext,
@@ -432,15 +488,28 @@ def _dispatch_builtin_command(
         # topics are disabled / this is a private chat, so it lives OUTSIDE
         # the `cfg.topics.enabled` guard above. Only the topic step inside
         # handle_clone_command is gated (KD4).
-        handler = partial(
-            handle_clone_command,
-            cfg,
-            msg,
-            args_text,
-            topic_store,
-            resolved_scope=resolved_scope,
-            scope_chat_ids=scope_chat_ids,
-        )
+        if ctx.running_tasks is not None and any(
+            ref.channel_id == msg.chat_id for ref in ctx.running_tasks
+        ):
+            # Guard against a double-send/retry starting a second
+            # concurrent git-clone + project-registration flow that could
+            # race on the same destination directory or `[projects.<alias>]`
+            # TOML section.
+            handler = partial(
+                reply,
+                text="a run is already in progress for this chat; wait for it to finish.",
+            )
+        else:
+            handler = partial(
+                _run_clone_command_tracked,
+                cfg,
+                msg,
+                args_text,
+                topic_store,
+                running_tasks=ctx.running_tasks,
+                resolved_scope=resolved_scope,
+                scope_chat_ids=scope_chat_ids,
+            )
         task_group.start_soon(handler)
         return True
 
@@ -1590,6 +1659,20 @@ async def run_main_loop(
                             "config.reload.triggers_failed",
                             error=str(exc),
                         )
+
+                # --- Hot-reload [clone] settings ---
+                # `[clone]` lives on the top-level UntetherSettings (like
+                # [triggers] above), not under [transports.telegram], so it
+                # never participates in the transport_snapshot diff /
+                # RESTART_REQUIRED_FIELDS logic a few lines up. Every
+                # CloneSettings field (root, allowed_hosts, default_engine,
+                # depth, enabled) is read fresh by handle_clone_command on
+                # each invocation via cfg.clone with no long-lived state
+                # keyed off it, so a plain reassignment is safe — no
+                # restart-required subset needed, unlike topics/session_mode.
+                if reload.settings.clone != cfg.clone:
+                    cfg.clone = reload.settings.clone
+                    logger.info("config.reload.clone_settings_applied")
 
             if watch_enabled and config_path is not None:
 

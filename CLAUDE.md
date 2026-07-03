@@ -50,6 +50,7 @@ Untether adds interactive permission control, plan mode support, and several UX 
 - **`diff_preview` plan bypass (#283)** — after user approves a plan outline via "Pause & Outline Plan", the `_discuss_approved` flag short-circuits diff preview for subsequent Edit/Write tools so no second approval is needed
 - **User-extensible env allowlist (#409)** — `[security] env_extra_allow` and `env_extra_prefix_allow` (in `untether.toml`) extend the engine-subprocess env allowlist with per-deployment names so users can thread credential-manager tokens (1Password, Doppler, Vault, Infisical, …) without forking `utils/env_policy.py`. Names are validated against `[A-Z_][A-Z0-9_]*`. Honoured by the Claude and Pi runners and by the `env_audit` probe. `BWS_ACCESS_TOKEN` was promoted into the built-in defaults at the same time. One `env_policy.user_extension` INFO log per process
 - **Master trigger pause toggle (#294)** — `TriggerManager.pause()` / `resume()` / `is_paused` gate cron firing and webhook dispatch globally; webhook server returns `503 triggers paused` (with `Retry-After: 60`); `/health` endpoint reflects paused state. Wired into `/config` two ways: home-page button row (only when triggers configured) and a dedicated `📡 Triggers` page (`config:tg`) showing counts + Pause/Resume button. `/ping` switches to `⏸ triggers paused: … (suspended)` while paused. Pause is in-memory only — restart auto-resumes (safe default)
+- **`/clone`** — clone a Git repo and register it as a project directly from Telegram (no terminal needed): `/clone https://github.com/owner/repo` (also accepts scp-style `git@host:owner/repo` URLs and an optional `--dir`/branch override). Runs a native `git clone` with the host's existing git credentials, derives a deduped alias, and writes the same `[projects.<alias>]` config entry `untether init` would; in a forum-enabled group it also creates a bound topic. Host allowlist (`[clone] allowed_hosts`, default `github.com`) and destination confinement to `[clone] root` guard against SSRF/path-escape; degrades to a register-only reply if the topic step fails or is out of scope
 
 See `.claude/skills/claude-stream-json/` and `.claude/rules/control-channel.md` for implementation details.
 
@@ -88,6 +89,7 @@ Telegram <-> TelegramPresenter <-> RunnerBridge <-> Runner (claude/codex/opencod
 | `commands/config.py` | `/config` inline settings menu |
 | `commands/ask_question.py` | AskUserQuestion option button handler |
 | `commands/topics.py` | `/new`, `/ctx`, `/topic` commands; `_cancel_chat_tasks()` helper |
+| `telegram/clone.py` | `/clone` command — URL parsing, `git clone` subprocess, project registration, optional topic creation |
 | `commands/listen.py` | `/listen` command (listen-mode toggle); `/trigger` deprecated alias (#297) |
 | `listen_mode.py` | `resolve_listen_mode()` and `should_trigger_run()` for response gating |
 | `utils/proc_diag.py` | `/proc` process diagnostics for stall analysis (CPU, RSS, TCP, FDs, children) |
