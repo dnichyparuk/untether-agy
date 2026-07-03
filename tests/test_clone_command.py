@@ -15,13 +15,17 @@ import os
 from dataclasses import replace
 from pathlib import Path
 
+import anyio
 import pytest
 
 import untether.runtime_loader as runtime_loader
+import untether.settings as settings_module
 import untether.telegram.clone as clone_module
+import untether.telegram.loop as loop_module
 from tests.telegram_fakes import FakeBot, FakeTransport, make_cfg
 from untether.config import ConfigError, read_config
 from untether.context import RunContext
+from untether.runner_bridge import RunningTask
 from untether.runtime_loader import build_runtime_spec
 from untether.settings import (
     CloneSettings,
@@ -31,6 +35,7 @@ from untether.settings import (
     validate_settings_data,
 )
 from untether.telegram.api_models import ForumTopic
+from untether.telegram.backend import _load_clone_settings
 from untether.telegram.clone import (
     CloneOutcome,
     RepoRef,
@@ -42,7 +47,14 @@ from untether.telegram.clone import (
     resolve_destination,
     run_git_clone,
 )
+from untether.telegram.loop import (
+    TelegramCommandContext,
+    _apply_clone_hot_reload,
+    _dispatch_builtin_command,
+    _run_clone_command_tracked,
+)
 from untether.telegram.types import TelegramIncomingMessage
+from untether.transport import MessageRef
 from untether.transport_runtime import TransportRuntime
 
 _TELEGRAM_BASE = (
@@ -1296,3 +1308,323 @@ class TestHandleCloneCommand:
         assert store.set_context_calls == []
         last = transport.send_calls[-1]["message"].text
         assert "run /topic myrepo" in last
+
+
+# ── handle_clone_command OSError paths (review-fix regression coverage) ────
+
+
+@pytest.mark.anyio
+class TestHandleCloneCommandErrorPaths:
+    """Cover the two OSError catch branches added in the review-fix pass.
+
+    A missing `git` binary surfaces as ``FileNotFoundError`` from
+    ``run_git_clone``, and a config-write IO error surfaces as ``OSError``
+    from ``register_project``. Both must reply gracefully rather than crash
+    the handler task.
+    """
+
+    async def test_git_spawn_oserror_replies_gracefully(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg, transport, bot, config_path = _orch_cfg(
+            tmp_path,
+            monkeypatch,
+            topics_enabled=True,
+            topic_result=ForumTopic(message_thread_id=7),
+        )
+
+        async def _raise(*_a: object, **_k: object) -> CloneOutcome:
+            raise FileNotFoundError("git")
+
+        monkeypatch.setattr(clone_module, "run_git_clone", _raise)
+        store = _RecordingTopicStore()
+        msg = _clone_msg("/clone https://github.com/owner/myrepo")
+
+        await handle_clone_command(
+            cfg,
+            msg,
+            args_text="https://github.com/owner/myrepo",
+            topic_store=store,  # type: ignore[arg-type]
+            resolved_scope="all",
+            scope_chat_ids=frozenset({msg.chat_id}),
+        )
+
+        # Graceful reply, no partial registration, no topic attempt.
+        assert "git clone failed" in transport.send_calls[-1]["message"].text
+        assert "myrepo" not in read_config(config_path).get("projects", {})
+        assert bot.create_topic_calls == []
+        assert store.set_context_calls == []
+
+    async def test_register_oserror_replies_gracefully(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # _orch_cfg installs a fake git, so run_git_clone succeeds and the
+        # handler reaches register_project — which we force to raise OSError.
+        cfg, transport, bot, config_path = _orch_cfg(
+            tmp_path,
+            monkeypatch,
+            topics_enabled=True,
+            topic_result=ForumTopic(message_thread_id=7),
+        )
+
+        def _raise(*_a: object, **_k: object) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(clone_module, "register_project", _raise)
+        store = _RecordingTopicStore()
+        msg = _clone_msg("/clone https://github.com/owner/myrepo")
+
+        await handle_clone_command(
+            cfg,
+            msg,
+            args_text="https://github.com/owner/myrepo",
+            topic_store=store,  # type: ignore[arg-type]
+            resolved_scope="all",
+            scope_chat_ids=frozenset({msg.chat_id}),
+        )
+
+        # Clone already happened; only registration failed → graceful reply,
+        # no topic step.
+        assert "failed to write config" in transport.send_calls[-1]["message"].text
+        assert store.set_context_calls == []
+
+
+@pytest.mark.anyio
+async def test_run_git_clone_propagates_when_git_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`run_git_clone` must let a spawn failure propagate (not swallow it).
+
+    The graceful-reply contract in `handle_clone_command` depends on
+    `run_git_clone` raising `OSError`/`FileNotFoundError` when `git` can't be
+    spawned, rather than converting it into an `ok=False` outcome.
+    """
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    monkeypatch.setenv("PATH", str(empty_bin))
+    ref = parse_repo_url(
+        "https://github.com/owner/myrepo", allowed_hosts=("github.com",)
+    )
+    dest = tmp_path / "dest"  # does not exist → no destination conflict
+
+    with pytest.raises((FileNotFoundError, OSError)):
+        await run_git_clone(ref, dest, branch=None, depth=1)
+
+
+# ── /clone dispatch: TOCTOU guard + tracked-task cleanup (loop.py) ─────────
+
+
+@pytest.mark.anyio
+class TestCloneDispatchTracking:
+    """Regression coverage for the synchronous RunningTask registration and
+    the `_run_clone_command_tracked` cleanup contract."""
+
+    async def test_dispatch_registers_running_task_synchronously(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[int] = []
+
+        async def _noop(*_a: object, **_k: object) -> None:
+            calls.append(1)
+
+        # Stub the actual clone so the scheduled wrapper is a no-op.
+        monkeypatch.setattr(loop_module, "handle_clone_command", _noop)
+
+        running_tasks: dict[MessageRef, RunningTask] = {}
+
+        async def _reply(*_a: object, **_k: object) -> None:
+            return None
+
+        msg = _clone_msg("/clone https://github.com/owner/myrepo")
+
+        async with anyio.create_task_group() as tg:
+            ctx = TelegramCommandContext(
+                cfg=make_cfg(FakeTransport()),
+                msg=msg,
+                args_text="https://github.com/owner/myrepo",
+                ambient_context=None,
+                topic_store=None,
+                chat_prefs=None,
+                resolved_scope="all",
+                scope_chat_ids=frozenset({msg.chat_id}),
+                reply=_reply,
+                task_group=tg,
+                running_tasks=running_tasks,
+            )
+            result = _dispatch_builtin_command(ctx=ctx, command_id="clone")
+            # Synchronous invariant: the guard-entry is registered BEFORE the
+            # scheduled coroutine runs (no await between guard check and
+            # registration) — this is what closes the TOCTOU window.
+            assert result is True
+            assert any(ref.channel_id == msg.chat_id for ref in running_tasks)
+
+        # After the task group drains, the no-op wrapper's finally popped it.
+        assert not any(ref.channel_id == msg.chat_id for ref in running_tasks)
+        assert calls == [1]
+
+    async def test_dispatch_second_concurrent_clone_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls: list[int] = []
+
+        async def _noop(*_a: object, **_k: object) -> None:
+            calls.append(1)
+
+        monkeypatch.setattr(loop_module, "handle_clone_command", _noop)
+
+        # A clone is already in flight for chat 123 (different message id).
+        running_tasks: dict[MessageRef, RunningTask] = {
+            MessageRef(channel_id=123, message_id=99): RunningTask()
+        }
+        replies: list[dict] = []
+
+        async def _reply(*_a: object, **kw: object) -> None:
+            replies.append(kw)
+
+        msg = _clone_msg("/clone https://github.com/owner/myrepo")
+
+        async with anyio.create_task_group() as tg:
+            ctx = TelegramCommandContext(
+                cfg=make_cfg(FakeTransport()),
+                msg=msg,
+                args_text="https://github.com/owner/myrepo",
+                ambient_context=None,
+                topic_store=None,
+                chat_prefs=None,
+                resolved_scope="all",
+                scope_chat_ids=frozenset({msg.chat_id}),
+                reply=_reply,
+                task_group=tg,
+                running_tasks=running_tasks,
+            )
+            result = _dispatch_builtin_command(ctx=ctx, command_id="clone")
+            assert result is True
+
+        # Guard fired: no new tracked run started, no extra entry registered,
+        # and the "already in progress" reply was sent.
+        assert calls == []
+        assert len(running_tasks) == 1
+        assert any(
+            "already in progress" in str(kw.get("text", "")) for kw in replies
+        )
+
+    async def test_tracked_wrapper_cleans_up_on_success(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _noop(*_a: object, **_k: object) -> None:
+            return None
+
+        monkeypatch.setattr(loop_module, "handle_clone_command", _noop)
+        ref = MessageRef(channel_id=123, message_id=1)
+        task = RunningTask()
+        running_tasks: dict[MessageRef, RunningTask] = {ref: task}
+        msg = _clone_msg("/clone https://github.com/owner/myrepo")
+
+        await _run_clone_command_tracked(
+            make_cfg(FakeTransport()),
+            msg,
+            "https://github.com/owner/myrepo",
+            None,
+            running_tasks=running_tasks,
+            running_task=task,
+            resolved_scope="all",
+            scope_chat_ids=frozenset({123}),
+        )
+
+        assert ref not in running_tasks
+        assert task.done.is_set()
+
+    async def test_tracked_wrapper_cleans_up_on_exception(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _boom(*_a: object, **_k: object) -> None:
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(loop_module, "handle_clone_command", _boom)
+        ref = MessageRef(channel_id=123, message_id=1)
+        task = RunningTask()
+        running_tasks: dict[MessageRef, RunningTask] = {ref: task}
+        msg = _clone_msg("/clone https://github.com/owner/myrepo")
+
+        with pytest.raises(RuntimeError):
+            await _run_clone_command_tracked(
+                make_cfg(FakeTransport()),
+                msg,
+                "https://github.com/owner/myrepo",
+                None,
+                running_tasks=running_tasks,
+                running_task=task,
+                resolved_scope="all",
+                scope_chat_ids=frozenset({123}),
+            )
+
+        # finally must still pop the entry and unblock resume waiters.
+        assert ref not in running_tasks
+        assert task.done.is_set()
+
+
+# ── [clone] hot-reload helper (loop.py) ───────────────────────────────────
+
+
+def test_apply_clone_hot_reload_updates_on_change() -> None:
+    cfg = make_cfg(FakeTransport())
+    new = CloneSettings(
+        root="/srv/new", allowed_hosts=["github.com", "gitlab.example.com"]
+    )
+    changed = _apply_clone_hot_reload(cfg, new)
+    assert changed is True
+    assert cfg.clone is new
+    assert cfg.clone.root == "/srv/new"
+
+
+def test_apply_clone_hot_reload_noop_when_equal() -> None:
+    cfg = make_cfg(FakeTransport())
+    same = cfg.clone.model_copy()
+    changed = _apply_clone_hot_reload(cfg, same)
+    assert changed is False
+    assert cfg.clone.root == CloneSettings().root
+
+
+# ── _load_clone_settings fallback branches (backend.py) ───────────────────
+
+
+def test_load_clone_settings_defaults_when_no_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        settings_module, "load_settings_if_exists", lambda *_a, **_k: None
+    )
+    assert _load_clone_settings() == CloneSettings()
+
+
+def test_load_clone_settings_falls_back_on_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(*_a: object, **_k: object) -> object:
+        raise RuntimeError("malformed toml")
+
+    monkeypatch.setattr(settings_module, "load_settings_if_exists", _boom)
+    assert _load_clone_settings() == CloneSettings()
+
+
+def test_load_clone_settings_reads_clone_section(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_settings = UntetherSettings.model_validate(
+        {
+            "transports": {
+                "telegram": {
+                    "bot_token": "tok",
+                    "chat_id": 1,
+                    "allow_any_user": True,
+                }
+            },
+            "clone": {"root": "/srv/x"},
+        }
+    )
+    monkeypatch.setattr(
+        settings_module,
+        "load_settings_if_exists",
+        lambda *_a, **_k: (fake_settings, Path("/x/untether.toml")),
+    )
+    assert _load_clone_settings().root == "/srv/x"
