@@ -1,0 +1,5 @@
+cmd	agy --version
+exit	0
+duration_s	0.231
+stdout_bytes	7
+stderr_bytes	0

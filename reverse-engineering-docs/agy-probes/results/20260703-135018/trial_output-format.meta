@@ -1,0 +1,5 @@
+cmd	agy --output-format x --agyprobe_undefZ
+exit	2
+duration_s	0.184
+stdout_bytes	0
+stderr_bytes	1627

@@ -1,0 +1,5 @@
+cmd	agy plugin --help
+exit	0
+duration_s	0.199
+stdout_bytes	0
+stderr_bytes	498

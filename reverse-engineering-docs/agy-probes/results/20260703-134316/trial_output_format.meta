@@ -1,0 +1,5 @@
+cmd	agy --output-format json --help
+exit	0
+duration_s	0.245
+stdout_bytes	0
+stderr_bytes	1578

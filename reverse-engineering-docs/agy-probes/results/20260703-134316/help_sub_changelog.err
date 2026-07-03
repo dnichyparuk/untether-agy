@@ -1,0 +1,7 @@
+Usage: agy changelog [flags]
+
+Show changelog and release notes
+
+Flags:
+  -h      Show help
+  --help  Show help

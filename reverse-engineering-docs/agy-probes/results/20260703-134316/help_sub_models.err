@@ -1,0 +1,7 @@
+Usage: agy models [flags]
+
+List available models
+
+Flags:
+  -h      Show help
+  --help  Show help

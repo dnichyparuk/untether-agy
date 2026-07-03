@@ -1,0 +1,10 @@
+./antigravity-oauth-token
+./cache/onboarding.json
+./installation_id
+./keybindings.json
+./knowledge/knowledge.lock
+./last_check.timestamp
+./log/cli-20260703_133639.log
+./settings.json
+./updater/update.lock
+./updater/update_status.json
