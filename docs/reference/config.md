@@ -542,6 +542,51 @@ here; plugin engines should document their own keys.
     dangerously_allow_all = true
     ```
 
+### `antigravity`
+
+Google's Antigravity CLI (`agy`). A **non-interactive, structured-result** engine:
+it returns a single JSON envelope at completion rather than a live event stream, so
+runs show "working…" then the final answer (no intermediate tool/file progress, no
+interactive approval or plan mode, and no USD cost — token counts only). See the
+[Antigravity runner reference](runners/antigravity/runner.md) for the full protocol.
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `model` | string | (unset) | Passed as `--model`; also used as the session title. Full display name, e.g. `"Gemini 3.1 Pro (High)"` (run `agy models` for the catalog). The reasoning tier is baked into the model name — there is no separate effort flag. |
+| `sandbox` | bool | `false` | Pass `--sandbox` to run agy in its sandbox. |
+| `auto_approve` | bool | `true` | Pass `--dangerously-skip-permissions` for headless auto-approve. Set `false` to keep agy's own permission gating — but note agy has no interactive approval channel through Untether, so a run needing approval will stall/fail rather than prompt. |
+| `print_timeout` | string | (unset) | Pass `--print-timeout <dur>` (agy's own default is `5m0s`). Use Go duration syntax, e.g. `"10m"`. |
+| `add_dirs` | string[] | `[]` | Extra directories exposed to agy, one `--add-dir` per entry. |
+| `extra_args` | string[] | `[]` | Extra CLI args for `agy`. Flags Untether manages internally (`-p`, `--print`, `--prompt`, `--output-format`, `--continue`/`-c`, `--conversation`, `--model`, `--dangerously-skip-permissions`, `--sandbox`) are rejected at config-load, since several are derived from the keys above. |
+
+=== "untether config"
+
+    ```sh
+    untether config set antigravity.model "Gemini 3.1 Pro (High)"
+    untether config set antigravity.sandbox false
+    untether config set antigravity.auto_approve true
+    untether config set antigravity.print_timeout "10m"
+    untether config set antigravity.add_dirs '["/path/to/extra"]'
+    ```
+
+=== "toml"
+
+    ```toml
+    [antigravity]
+    model = "Gemini 3.1 Pro (High)"
+    sandbox = false
+    auto_approve = true
+    print_timeout = "10m"
+    add_dirs = ["/path/to/extra"]
+    ```
+
+!!! note "Authentication"
+    `agy` authenticates via the OS keyring → Google OAuth; there is no API-key
+    environment variable, and Untether filters the subprocess environment
+    ([#198](https://github.com/littlebearapps/untether/issues/198)). Because Untether
+    runs headless, complete an interactive `agy` login once on the host so the daemon
+    inherits the saved session.
+
 ## Triggers
 
 Webhook and cron triggers that start agent runs from external events. See the

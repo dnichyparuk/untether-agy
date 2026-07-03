@@ -56,7 +56,9 @@ inherit the full daemon environment.
 | `extra_args` | list[string] | `[]` | appended (Untether-managed flags rejected) |
 
 Reserved flags (rejected in `extra_args`): `-p`, `--print`, `--prompt`, `--output-format`,
-`--continue`, `-c`, `--conversation`, `--model`.
+`--continue`, `-c`, `--conversation`, `--model`, `--dangerously-skip-permissions`, `--sandbox`.
+The last two are derived from the `auto_approve` / `sandbox` config booleans, so allowing them
+via `extra_args` could silently contradict the configured permission stance.
 
 ## Resume
 
