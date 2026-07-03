@@ -13,6 +13,7 @@ from ..logging import get_logger
 from ..markdown import MarkdownFormatter
 from ..runner_bridge import ExecBridgeConfig
 from ..settings import (
+    CloneSettings,
     ProgressSettings,
     TelegramTopicsSettings,
     TelegramTransportSettings,
@@ -45,6 +46,27 @@ def _load_progress_settings() -> ProgressSettings:
     except Exception:  # noqa: BLE001
         logger.debug("progress_settings.load_failed", exc_info=True)
         return ProgressSettings()
+
+
+def _load_clone_settings() -> CloneSettings:
+    """Load `[clone]` settings from config, returning defaults if unavailable.
+
+    ``[clone]`` lives on the top-level :class:`UntetherSettings`, not on the
+    per-transport ``[transports.telegram]`` block, so it isn't available on
+    the ``TelegramTransportSettings`` passed into ``build_and_run``. Mirror
+    :func:`_load_progress_settings` to read it from the full settings.
+    """
+    try:
+        from ..settings import load_settings_if_exists
+
+        result = load_settings_if_exists()
+        if result is None:
+            return CloneSettings()
+        settings, _ = result
+        return settings.clone
+    except Exception:  # noqa: BLE001
+        logger.debug("clone_settings.load_failed", exc_info=True)
+        return CloneSettings()
 
 
 def _expect_transport_settings(transport_config: object) -> TelegramTransportSettings:
@@ -289,6 +311,7 @@ class TelegramBackend(TransportBackend):
             allow_any_user=settings.allow_any_user,
             topics=settings.topics,
             files=settings.files,
+            clone=_load_clone_settings(),
             trigger_config=trigger_config,
         )
 

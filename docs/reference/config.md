@@ -154,6 +154,33 @@ File size limits (not configurable):
 
 Legacy config note: top-level `bot_token` / `chat_id` are auto-migrated into `[transports.telegram]` on startup.
 
+Projects can also be registered from Telegram without touching `untether.toml` at all — see [`clone`](#clone) below.
+
+## `clone`
+
+Settings for the `/clone` command — cloning a GitHub repo from Telegram and auto-registering it as a `projects.<alias>` entry (see above). See [commands-and-directives.md](commands-and-directives.md) for the `/clone` grammar and behaviour, and [Projects: bootstrap a repo with /clone](../how-to/projects.md#bootstrap-a-repo-from-telegram-with-clone) for a walkthrough.
+
+=== "toml"
+
+    ```toml
+    [clone]
+    enabled = true
+    root = "~/untether-projects"
+    allowed_hosts = ["github.com"]
+    default_engine = "claude"
+    depth = 1
+    ```
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `enabled` | bool | `true` | Enable the `/clone` command. Set `false` to disable it entirely. |
+| `root` | string | `"~/untether-projects"` | Default parent directory new clones land under (expands `~`). The `--dir` override must resolve to a path under this root — an override that walks out via `..`, an absolute path elsewhere, or a symlink escaping `root` is rejected. |
+| `allowed_hosts` | string[] | `["github.com"]` | Git hosts `/clone` will accept, checked case-insensitively against both the `https://<host>/...` and `git@<host>:...` URL forms. |
+| `default_engine` | string | `"claude"` | Engine written into the new project's `default_engine` field at registration time. Only seeds the initial choice — it doesn't affect ongoing engine selection, which is governed by `projects.<alias>.default_engine` (or the top-level `default_engine`) once the project exists. |
+| `depth` | int (≥1) | `1` | Passed to `git clone` as `--depth <n> --single-branch` for a shallow clone. |
+
+Host git credentials (existing SSH keys, credential helpers) are used as-is — v1 does no token injection, and `GIT_TERMINAL_PROMPT=0` / a batch-mode `GIT_SSH_COMMAND` make an auth-required clone fail fast instead of hanging on a prompt.
+
 ## Plugins
 
 ### `plugins.enabled`
