@@ -45,6 +45,9 @@ logger = get_logger(__name__)
 
 ENGINE: EngineId = "antigravity"
 
+# Max chars of a malformed stdout line surfaced to the user (full line is logged).
+_INVALID_JSON_EXCERPT = 500
+
 # Matches the resume footer `agy --conversation <uuid>` so a reply resumes the
 # right conversation via AutoRouter.
 _RESUME_RE = re.compile(
@@ -52,7 +55,11 @@ _RESUME_RE = re.compile(
 )
 
 # Flags Untether manages itself — reject in [antigravity] extra_args so users
-# can't break the I/O contract (mirrors the claude runner's reserved-flag guard).
+# can't break the I/O contract or contradict a dedicated config key (mirrors the
+# claude/codex reserved-flag guards). `--dangerously-skip-permissions` and
+# `--sandbox` are derived from the `auto_approve`/`sandbox` booleans, so allowing
+# them via extra_args would let a user silently re-enable full access even with
+# `auto_approve = false` — hence they are reserved.
 _RESERVED_FLAGS: frozenset[str] = frozenset(
     {
         "-p",
@@ -63,6 +70,8 @@ _RESERVED_FLAGS: frozenset[str] = frozenset(
         "-c",
         "--conversation",
         "--model",
+        "--dangerously-skip-permissions",
+        "--sandbox",
     }
 )
 
@@ -108,13 +117,23 @@ def translate_antigravity_result(
     title: str,
     state: AntigravityStreamState,
     meta: dict[str, Any] | None,
+    resume_fallback: ResumeToken | None = None,
 ) -> list[UntetherEvent]:
-    """Translate the single agy result envelope into Started + Completed events."""
+    """Translate the single agy result envelope into Started + Completed events.
+
+    When the envelope omits `conversation_id` (e.g. some failure envelopes),
+    fall back to `resume_fallback` (the token the run was resumed from) so we
+    never emit a broken `agy --conversation ` footer or an empty-valued
+    ``ResumeToken``. If neither is available, resume is omitted entirely.
+    """
     out: list[UntetherEvent] = []
     state.saw_result = True
     conversation_id = evt.conversation_id or ""
     state.session_id = conversation_id or state.session_id
-    resume = ResumeToken(engine=ENGINE, value=conversation_id)
+    if conversation_id:
+        resume: ResumeToken | None = ResumeToken(engine=ENGINE, value=conversation_id)
+    else:
+        resume = resume_fallback
 
     if not state.emitted_started:
         state.emitted_started = True
@@ -124,10 +143,18 @@ def translate_antigravity_result(
             model=state.model,
             title=title,
         )
+        # StartedEvent.resume is required; when we have no real token at all
+        # (envelope lacked conversation_id and this was not a resume) use an
+        # empty-valued placeholder for the internal Started registration only —
+        # the user-facing CompletedEvent footer keeps resume=None (below) so no
+        # broken `agy --conversation ` line is ever rendered.
+        started_resume = (
+            resume if resume is not None else ResumeToken(engine=ENGINE, value="")
+        )
         out.append(
             StartedEvent(
                 engine=ENGINE,
-                resume=resume,
+                resume=started_resume,
                 title=title,
                 meta=meta or None,
             )
@@ -282,6 +309,7 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             title=self.session_title,
             state=state,
             meta=self._meta(),
+            resume_fallback=found_session or resume,
         )
 
     def decode_jsonl(
@@ -296,8 +324,19 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         line: str,
         state: AntigravityStreamState,
     ) -> list[UntetherEvent]:
+        # Log the full (untruncated) line for operators, but only surface a
+        # bounded excerpt to the user — the line reader caps at 10 MB, so a
+        # garbage/partial line could otherwise flood the Telegram progress feed.
+        self.get_logger().warning(
+            "jsonl.invalid_json",
+            tag=self.tag(),
+            line=raw,
+        )
+        excerpt = raw if len(raw) <= _INVALID_JSON_EXCERPT else (
+            raw[:_INVALID_JSON_EXCERPT] + "…"
+        )
         message = "invalid JSON from agy; ignoring line"
-        return [self.note_event(message, state=state, detail={"line": raw})]
+        return [self.note_event(message, state=state, detail={"line": excerpt})]
 
     def decode_error_events(
         self,
@@ -339,7 +378,12 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         if excerpt:
             parts.append(excerpt)
         message = "\n".join(parts)
-        logger.error("antigravity.process.failed", rc=rc, session_id=state.session_id)
+        self.get_logger().error(
+            "antigravity.process.failed",
+            tag=self.tag(),
+            rc=rc,
+            session_id=state.session_id,
+        )
         return [
             self.note_event(message, state=state, ok=False),
             CompletedEvent(
@@ -365,7 +409,7 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         if session:
             parts.append(f"session: {session}")
         message = "\n".join(parts)
-        logger.warning("antigravity.stream.no_result")
+        self.get_logger().warning("antigravity.stream.no_result", tag=self.tag())
         return [
             CompletedEvent(
                 engine=ENGINE,

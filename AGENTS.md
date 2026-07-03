@@ -5,7 +5,7 @@ Telegram bridge for AI coding agents. Control Claude Code, Codex, OpenCode, Pi, 
 ## Architecture
 
 ```
-Telegram <-> TelegramPresenter <-> RunnerBridge <-> Runner (claude/codex/opencode/pi/gemini/amp)
+Telegram <-> TelegramPresenter <-> RunnerBridge <-> Runner (claude/codex/opencode/pi/gemini/amp/antigravity)
                                        |
                                   ProgressTracker
 ```

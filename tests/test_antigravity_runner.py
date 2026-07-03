@@ -93,6 +93,38 @@ def test_translate_started_emitted_once() -> None:
     assert not any(isinstance(e, StartedEvent) for e in second)
 
 
+def test_translate_empty_conversation_id_falls_back_to_resume() -> None:
+    # A failure envelope lacking conversation_id must reuse the resume token the
+    # run was resumed from, not emit an empty-valued token.
+    state = AntigravityStreamState()
+    evt = _decode({"status": "ERROR", "response": "", "error": "boom"})
+    prior = ResumeToken(engine=ENGINE, value="prior-conv-42")
+    events = translate_antigravity_result(
+        evt, title="antigravity", state=state, meta=None, resume_fallback=prior
+    )
+    started, completed = events
+    assert isinstance(started, StartedEvent)
+    assert isinstance(completed, CompletedEvent)
+    assert started.resume == prior
+    assert completed.resume == prior
+
+
+def test_translate_empty_conversation_id_no_fallback_omits_footer() -> None:
+    # No conversation_id and no fallback: the user-facing CompletedEvent must not
+    # carry an empty-valued resume token (which would render `agy --conversation `).
+    state = AntigravityStreamState()
+    evt = _decode({"status": "ERROR", "response": "", "error": "boom"})
+    events = translate_antigravity_result(
+        evt, title="antigravity", state=state, meta=None
+    )
+    started, completed = events
+    assert completed.resume is None
+    # StartedEvent.resume is required; the placeholder is empty-valued but never
+    # surfaced in the footer.
+    assert isinstance(started, StartedEvent)
+    assert started.resume.value == ""
+
+
 def test_permission_mode_composition() -> None:
     runner = AntigravityRunner(auto_approve=True, sandbox=True)
     evt = _decode({"conversation_id": "x", "status": "SUCCESS", "response": "a"})
@@ -179,6 +211,28 @@ def test_stream_end_no_envelope() -> None:
     assert events[0].ok is False
 
 
+def test_invalid_json_events_truncates_excerpt() -> None:
+    runner = AntigravityRunner()
+    raw = "x" * 5000
+    events = runner.invalid_json_events(
+        raw=raw, line=raw, state=AntigravityStreamState()
+    )
+    assert len(events) == 1
+    line = events[0].action.detail["line"]
+    # Bounded excerpt (500 chars + ellipsis), not the full 5000-char blob.
+    assert line.endswith("…")
+    assert len(line) <= 501
+
+
+def test_invalid_json_events_short_line_not_truncated() -> None:
+    runner = AntigravityRunner()
+    raw = '{"partial": true'
+    events = runner.invalid_json_events(
+        raw=raw, line=raw, state=AntigravityStreamState()
+    )
+    assert events[0].action.detail["line"] == raw
+
+
 def test_process_error_nonzero_rc() -> None:
     runner = AntigravityRunner()
     events = runner.process_error_events(
@@ -204,6 +258,14 @@ def test_build_runner_defaults(tmp_path: Path) -> None:
 def test_build_runner_rejects_reserved_flag(tmp_path: Path) -> None:
     with pytest.raises(ConfigError):
         build_runner({"extra_args": ["--model", "x"]}, tmp_path / "untether.toml")
+
+
+def test_build_runner_rejects_permission_flags(tmp_path: Path) -> None:
+    # Permission-relevant flags are derived from the auto_approve/sandbox config
+    # booleans; extra_args must not be able to re-enable or contradict them.
+    for flag in ("--dangerously-skip-permissions", "--sandbox"):
+        with pytest.raises(ConfigError):
+            build_runner({"extra_args": [flag]}, tmp_path / "untether.toml")
 
 
 def test_build_runner_rejects_bad_model(tmp_path: Path) -> None:
