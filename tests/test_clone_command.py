@@ -71,7 +71,9 @@ def test_clone_settings_defaults() -> None:
     assert settings.enabled is True
     assert settings.root == "~/untether-projects"
     assert settings.allowed_hosts == ["github.com"]
-    assert settings.default_engine == "claude"
+    # Default is None: cloned projects inherit the global default_engine
+    # rather than being pinned to a hardcoded engine at clone time.
+    assert settings.default_engine is None
     assert settings.depth == 1
 
 
@@ -913,6 +915,9 @@ class TestHandleCloneCommand:
         # Project registered on disk.
         raw = read_config(config_path)
         assert "myrepo" in raw["projects"]
+        # With the default (unset) clone engine, no default_engine is pinned
+        # onto the project — it inherits the global default_engine instead.
+        assert "default_engine" not in raw["projects"]["myrepo"]
         # Topic created and context pinned with the branch honoured.
         assert bot.create_topic_calls, "expected create_forum_topic to be called"
         assert len(store.set_context_calls) == 1
