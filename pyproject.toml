@@ -60,6 +60,7 @@ opencode = "untether.runners.opencode:BACKEND"
 pi = "untether.runners.pi:BACKEND"
 gemini = "untether.runners.gemini:BACKEND"
 amp = "untether.runners.amp:BACKEND"
+antigravity = "untether.runners.antigravity:BACKEND"
 
 [project.entry-points."untether.transport_backends"]
 telegram = "untether.telegram.backend:BACKEND"

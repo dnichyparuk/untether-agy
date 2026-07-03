@@ -154,6 +154,33 @@ File size limits (not configurable):
 
 Legacy config note: top-level `bot_token` / `chat_id` are auto-migrated into `[transports.telegram]` on startup.
 
+Projects can also be registered from Telegram without touching `untether.toml` at all — see [`clone`](#clone) below.
+
+## `clone`
+
+Settings for the `/clone` command — cloning a GitHub repo from Telegram and auto-registering it as a `projects.<alias>` entry (see above). See [commands-and-directives.md](commands-and-directives.md) for the `/clone` grammar and behaviour, and [Projects: bootstrap a repo with /clone](../how-to/projects.md#bootstrap-a-repo-from-telegram-with-clone) for a walkthrough.
+
+=== "toml"
+
+    ```toml
+    [clone]
+    enabled = true
+    root = "~/untether-projects"
+    allowed_hosts = ["github.com"]
+    default_engine = "claude"
+    depth = 1
+    ```
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `enabled` | bool | `true` | Enable the `/clone` command. Set `false` to disable it entirely. |
+| `root` | string | `"~/untether-projects"` | Default parent directory new clones land under (expands `~`). The `--dir` override must resolve to a path under this root — an override that walks out via `..`, an absolute path elsewhere, or a symlink escaping `root` is rejected. |
+| `allowed_hosts` | string[] | `["github.com"]` | Git hosts `/clone` will accept, checked case-insensitively against both the `https://<host>/...` and `git@<host>:...` URL forms. |
+| `default_engine` | string | `"claude"` | Engine written into the new project's `default_engine` field at registration time. Only seeds the initial choice — it doesn't affect ongoing engine selection, which is governed by `projects.<alias>.default_engine` (or the top-level `default_engine`) once the project exists. |
+| `depth` | int (≥1) | `1` | Passed to `git clone` as `--depth <n> --single-branch` for a shallow clone. |
+
+Host git credentials (existing SSH keys, credential helpers) are used as-is — v1 does no token injection, and `GIT_TERMINAL_PROMPT=0` / a batch-mode `GIT_SSH_COMMAND` make an auth-required clone fail fast instead of hanging on a prompt.
+
 ## Plugins
 
 ### `plugins.enabled`
@@ -541,6 +568,51 @@ here; plugin engines should document their own keys.
     mode = "deep"
     dangerously_allow_all = true
     ```
+
+### `antigravity`
+
+Google's Antigravity CLI (`agy`). A **non-interactive, structured-result** engine:
+it returns a single JSON envelope at completion rather than a live event stream, so
+runs show "working…" then the final answer (no intermediate tool/file progress, no
+interactive approval or plan mode, and no USD cost — token counts only). See the
+[Antigravity runner reference](runners/antigravity/runner.md) for the full protocol.
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `model` | string | (unset) | Passed as `--model`; also used as the session title. Full display name, e.g. `"Gemini 3.1 Pro (High)"` (run `agy models` for the catalog). The reasoning tier is baked into the model name — there is no separate effort flag. |
+| `sandbox` | bool | `false` | Pass `--sandbox` to run agy in its sandbox. |
+| `auto_approve` | bool | `true` | Pass `--dangerously-skip-permissions` for headless auto-approve. Set `false` to keep agy's own permission gating — but note agy has no interactive approval channel through Untether, so a run needing approval will stall/fail rather than prompt. |
+| `print_timeout` | string | (unset) | Pass `--print-timeout <dur>` (agy's own default is `5m0s`). Use Go duration syntax, e.g. `"10m"`. |
+| `add_dirs` | string[] | `[]` | Extra directories exposed to agy, one `--add-dir` per entry. |
+| `extra_args` | string[] | `[]` | Extra CLI args for `agy`. Flags Untether manages internally (`-p`, `--print`, `--prompt`, `--output-format`, `--continue`/`-c`, `--conversation`, `--model`, `--dangerously-skip-permissions`, `--sandbox`) are rejected at config-load, since several are derived from the keys above. |
+
+=== "untether config"
+
+    ```sh
+    untether config set antigravity.model "Gemini 3.1 Pro (High)"
+    untether config set antigravity.sandbox false
+    untether config set antigravity.auto_approve true
+    untether config set antigravity.print_timeout "10m"
+    untether config set antigravity.add_dirs '["/path/to/extra"]'
+    ```
+
+=== "toml"
+
+    ```toml
+    [antigravity]
+    model = "Gemini 3.1 Pro (High)"
+    sandbox = false
+    auto_approve = true
+    print_timeout = "10m"
+    add_dirs = ["/path/to/extra"]
+    ```
+
+!!! note "Authentication"
+    `agy` authenticates via the OS keyring → Google OAuth; there is no API-key
+    environment variable, and Untether filters the subprocess environment
+    ([#198](https://github.com/littlebearapps/untether/issues/198)). Because Untether
+    runs headless, complete an interactive `agy` login once on the host so the daemon
+    inherits the saved session.
 
 ## Triggers
 

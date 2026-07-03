@@ -13,6 +13,7 @@ Prefix the first non-empty line with an engine directive:
 /pi render a diorama of this timeline
 /gemini analyse the codebase architecture
 /amp review recent changes
+/antigravity summarise the open TODOs
 ```
 
 Directives are only parsed at the start of the first non-empty line.
@@ -45,7 +46,14 @@ Selection precedence (highest to lowest): resume token → `/<engine-id>` direct
 ## Engine installation
 
 Untether shells out to engine CLIs. Install them and make sure they’re on your `PATH`
-(`codex`, `claude`, `opencode`, `pi`, `gemini`, `amp`). Authentication is handled by each CLI.
+(`codex`, `claude`, `opencode`, `pi`, `gemini`, `amp`, `agy`). Authentication is handled by each CLI.
+
+Antigravity (`agy`) installs with:
+
+```sh
+curl -fsSL https://antigravity.google/cli/install.sh | bash
+agy   # run once interactively to complete Google OAuth login before headless use
+```
 
 ## Feature differences
 

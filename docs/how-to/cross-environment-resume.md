@@ -45,6 +45,7 @@ Each engine CLI stores sessions per directory. Untether projects map to director
 | Gemini CLI | ✅ | `--resume latest` | Tested, works reliably |
 | OpenCode | ✅ | `--continue` | Tested via dev bot; requires latest OpenCode version |
 | Pi | ✅ | `--continue` | Requires `provider` config for OAuth subscriptions (see below) |
+| Antigravity (`agy`) | ✅ | `--continue` | Resumes the machine-most-recent conversation (machine-global, not per-project) |
 | Amp | — | N/A | Requires explicit thread ID; no "most recent" mode |
 
 ### Pi provider configuration

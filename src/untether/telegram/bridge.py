@@ -14,6 +14,7 @@ from ..progress import ProgressState
 from ..runner_bridge import ExecBridgeConfig, RunningTask, RunningTasks
 from ..scheduler import ThreadScheduler
 from ..settings import (
+    CloneSettings,
     TelegramFilesSettings,
     TelegramTopicsSettings,
     TelegramTransportSettings,
@@ -159,6 +160,13 @@ class TelegramBridgeConfig:
     the projects table at startup and is not exposed via the transport
     settings hot-reload path. Use :meth:`update_from` to apply reloaded
     transport settings.
+
+    ``clone`` (the ``[clone]`` command settings) is not a transport-settings
+    field, so it is outside :meth:`update_from`; it is instead hot-reloaded
+    by a dedicated branch in ``telegram/loop.py``'s ``handle_reload`` (direct
+    reassignment, mirroring the ``[triggers]`` precedent) since ``[clone]``
+    lives on the top-level ``UntetherSettings`` rather than under
+    ``[transports.telegram]``.
     """
 
     bot: BotClient
@@ -185,6 +193,10 @@ class TelegramBridgeConfig:
     files: TelegramFilesSettings = field(default_factory=TelegramFilesSettings)
     chat_ids: tuple[int, ...] | None = None
     topics: TelegramTopicsSettings = field(default_factory=TelegramTopicsSettings)
+    # `/clone` command settings (`[clone]` in untether.toml). Threaded in
+    # here so the loop.py-routed clone handler can reach clone.root /
+    # allowed_hosts / default_engine / depth without re-reading config.
+    clone: CloneSettings = field(default_factory=CloneSettings)
     trigger_config: dict | None = None
     # rc4 (#269/#285): trigger_manager is assigned after construction once the
     # trigger settings have been parsed; commands read it via CommandContext.
