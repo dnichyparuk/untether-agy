@@ -22,7 +22,7 @@ from ..model import EngineId, ResumeToken
 from ..progress import ProgressTracker
 from ..runners.run_options import EngineRunOptions
 from ..scheduler import ThreadJob, ThreadScheduler
-from ..settings import TelegramTransportSettings
+from ..settings import CloneSettings, TelegramTransportSettings
 from ..transport import MessageRef, RenderedMessage, SendOptions
 from ..transport_runtime import ResolvedMessage
 from .bridge import CANCEL_CALLBACK_DATA, TelegramBridgeConfig, send_plain
@@ -369,6 +369,30 @@ async def _run_clone_command_tracked(
             running_tasks.pop(ref, None)
         if running_task is not None:
             running_task.done.set()
+
+
+def _apply_clone_hot_reload(
+    cfg: TelegramBridgeConfig, new_settings: CloneSettings
+) -> bool:
+    """Apply reloaded ``[clone]`` settings to *cfg* in place; return whether changed.
+
+    ``[clone]`` lives on the top-level ``UntetherSettings`` (like ``[triggers]``),
+    not under ``[transports.telegram]``, so it never participates in the
+    transport_snapshot diff / ``RESTART_REQUIRED_FIELDS`` logic in
+    ``handle_reload``. Every :class:`CloneSettings` field (root, allowed_hosts,
+    default_engine, depth, enabled) is read fresh by ``handle_clone_command`` on
+    each invocation via ``cfg.clone`` with no long-lived state keyed off it, so a
+    plain reassignment is safe — no restart-required subset needed, unlike
+    topics/session_mode.
+
+    Extracted from the ``handle_reload`` closure so the reassign-on-change
+    behavior is unit-testable. Returns ``True`` when the settings differed and
+    ``cfg.clone`` was updated, ``False`` when they were already equal (no-op).
+    """
+    if new_settings != cfg.clone:
+        cfg.clone = new_settings
+        return True
+    return False
 
 
 def _dispatch_builtin_command(
@@ -1680,17 +1704,7 @@ async def run_main_loop(
                         )
 
                 # --- Hot-reload [clone] settings ---
-                # `[clone]` lives on the top-level UntetherSettings (like
-                # [triggers] above), not under [transports.telegram], so it
-                # never participates in the transport_snapshot diff /
-                # RESTART_REQUIRED_FIELDS logic a few lines up. Every
-                # CloneSettings field (root, allowed_hosts, default_engine,
-                # depth, enabled) is read fresh by handle_clone_command on
-                # each invocation via cfg.clone with no long-lived state
-                # keyed off it, so a plain reassignment is safe — no
-                # restart-required subset needed, unlike topics/session_mode.
-                if reload.settings.clone != cfg.clone:
-                    cfg.clone = reload.settings.clone
+                if _apply_clone_hot_reload(cfg, reload.settings.clone):
                     logger.info("config.reload.clone_settings_applied")
 
             if watch_enabled and config_path is not None:
