@@ -550,7 +550,12 @@ async def handle_clone_command(
             message=RenderedMessage(text=rendered_text, extra={"entities": entities}),
             options=SendOptions(thread_id=thread_id),
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 — intentionally broad: the
+        # topic step is best-effort (see the "NEVER hard-fails" contract in
+        # this function's docstring / KD4). Any failure from create_forum_topic
+        # or set_context — Telegram API error, network error, or a store
+        # I/O error — degrades to the same register-only reply rather than
+        # risking a raise that would abort an already-successful clone.
         logger.warning(
             "clone.topic.failed",
             chat_id=msg.chat_id,

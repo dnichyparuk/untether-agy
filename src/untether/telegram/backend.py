@@ -64,7 +64,11 @@ def _load_clone_settings() -> CloneSettings:
             return CloneSettings()
         settings, _ = result
         return settings.clone
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — intentionally broad: this is a
+        # best-effort startup read of an optional config section (missing
+        # file, malformed TOML, permission error, or a schema violation
+        # elsewhere in the file should all fall back to defaults rather
+        # than abort startup); mirrors `_load_progress_settings` above.
         logger.debug("clone_settings.load_failed", exc_info=True)
         return CloneSettings()
 
