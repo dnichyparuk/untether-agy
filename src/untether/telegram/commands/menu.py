@@ -22,6 +22,7 @@ def build_bot_commands(
     *,
     include_file: bool = True,
     include_topics: bool = False,
+    include_clone: bool = False,
 ) -> list[dict[str, str]]:
     commands: list[dict[str, str]] = []
     seen: set[str] = set()
@@ -91,6 +92,14 @@ def build_bot_commands(
                 continue
             commands.append({"command": cmd, "description": description})
             seen.add(cmd)
+    # `clone` is a built-in reserved command (handled inline in loop.py, not a
+    # plugin entry point), so it's excluded from the entry-point loop above by
+    # RESERVED_COMMAND_IDS. Surface it in the menu only when /clone is enabled.
+    if include_clone and "clone" not in seen:
+        commands.append(
+            {"command": "clone", "description": "clone a git repo & register it"}
+        )
+        seen.add("clone")
     if include_file and "file" not in seen:
         commands.append({"command": "file", "description": "upload or fetch files"})
         seen.add("file")
@@ -121,6 +130,7 @@ async def _set_command_menu(cfg: TelegramBridgeConfig) -> None:
         cfg.runtime,
         include_file=cfg.files.enabled,
         include_topics=cfg.topics.enabled,
+        include_clone=cfg.clone.enabled,
     )
     if not commands:
         return
