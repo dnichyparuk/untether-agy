@@ -319,6 +319,7 @@ async def _run_clone_command_tracked(
     topic_store: TopicStateStore | None,
     *,
     running_tasks: RunningTasks | None,
+    running_task: RunningTask | None,
     resolved_scope: str | None,
     scope_chat_ids: frozenset[int],
 ) -> None:
@@ -329,11 +330,19 @@ async def _run_clone_command_tracked(
     agent runs it has no live progress message to key a
     :class:`~untether.runner_bridge.RunningTask` entry on, so the incoming
     command message doubles as the :class:`~untether.transport.MessageRef`.
-    Registering it here (mirroring how agent runs register themselves in
-    ``runner_bridge.handle_message``) lets ``_cancel_chat_tasks()`` (``/new``)
-    see the in-flight clone and lets ``_drain_and_exit()`` wait for it
-    instead of hard-cancelling it mid-clone/mid-write during a graceful
-    restart.
+
+    The *running_task* entry is created and registered **synchronously by
+    the dispatcher** (``_dispatch_builtin_command``) *before* this coroutine
+    is scheduled — not here — so the "a run is already in progress" guard and
+    the registration are atomic with respect to a double-send arriving in the
+    same ``poll_incoming`` batch (no ``await`` between the guard check and the
+    registration). This closes the TOCTOU window that existed when
+    registration was deferred into this coroutine. Registering it (mirroring
+    how agent runs register themselves in ``runner_bridge.handle_message``)
+    lets ``_cancel_chat_tasks()`` (``/new``) see the in-flight clone and lets
+    ``_drain_and_exit()`` wait for it instead of hard-cancelling it
+    mid-clone/mid-write during a graceful restart. This coroutine owns only
+    the *cleanup* half of that lifecycle (the ``finally`` below).
 
     A user can also reply directly to the ``/clone`` command message while
     it's running; ``ResumeResolver.resolve()`` looks up *running_tasks* by
@@ -346,12 +355,6 @@ async def _run_clone_command_tracked(
     instead of hanging until process shutdown.
     """
     ref = MessageRef(channel_id=msg.chat_id, message_id=msg.message_id)
-    running_task = None
-    if running_tasks is not None:
-        from ..runner_bridge import RunningTask
-
-        running_task = RunningTask()
-        running_tasks[ref] = running_task
     try:
         await handle_clone_command(
             cfg,
@@ -500,6 +503,21 @@ def _dispatch_builtin_command(
                 text="a run is already in progress for this chat; wait for it to finish.",
             )
         else:
+            # Register the RunningTask entry SYNCHRONOUSLY here, before
+            # `start_soon`, rather than inside the scheduled coroutine.
+            # `_dispatch_builtin_command` runs with no `await` between the
+            # guard check above and this registration, so a second `/clone`
+            # arriving in the same `poll_incoming` batch will observe the
+            # entry and hit the guard — closing the TOCTOU window that
+            # existed when registration was deferred into the coroutine.
+            running_task = None
+            if ctx.running_tasks is not None:
+                from ..runner_bridge import RunningTask
+
+                running_task = RunningTask()
+                ctx.running_tasks[
+                    MessageRef(channel_id=msg.chat_id, message_id=msg.message_id)
+                ] = running_task
             handler = partial(
                 _run_clone_command_tracked,
                 cfg,
@@ -507,6 +525,7 @@ def _dispatch_builtin_command(
                 args_text,
                 topic_store,
                 running_tasks=ctx.running_tasks,
+                running_task=running_task,
                 resolved_scope=resolved_scope,
                 scope_chat_ids=scope_chat_ids,
             )
@@ -803,7 +822,7 @@ class TelegramLoopState:
 
 
 if TYPE_CHECKING:
-    from ..runner_bridge import RunningTasks
+    from ..runner_bridge import RunningTask, RunningTasks
     from ..triggers.manager import TriggerManager
 
 
