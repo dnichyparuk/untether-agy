@@ -1,6 +1,6 @@
 # Untether
 
-Telegram bridge for Claude Code, Codex, OpenCode, Pi, Gemini CLI, Amp, and other agent CLIs. Control your coding agents from anywhere — walking the dog, watching footy, at a friend's place.
+Telegram bridge for Claude Code, Codex, OpenCode, Pi, Gemini CLI, Amp, Antigravity (`agy`), and other agent CLIs. Control your coding agents from anywhere — walking the dog, watching footy, at a friend's place.
 
 **Repo**: [littlebearapps/untether](https://github.com/littlebearapps/untether)
 **Based on**: [banteg/takopi](https://github.com/banteg/takopi) (upstream)
@@ -73,6 +73,7 @@ Telegram <-> TelegramPresenter <-> RunnerBridge <-> Runner (claude/codex/opencod
 | `runners/claude.py` | Claude Code runner, interactive features |
 | `runners/gemini.py` | Gemini CLI runner |
 | `runners/amp.py` | AMP CLI runner (Sourcegraph) |
+| `runners/antigravity.py` | Antigravity CLI (`agy`) runner — non-interactive, structured JSON result envelope (no live progress) |
 | `runner_bridge.py` | Connects runners to Telegram presenter, injects agent preamble, auto-continue with signal death suppression |
 | `cost_tracker.py` | Per-run/daily cost tracking and budget alerts |
 | `commands/claude_control.py` | Approve/Deny/Discuss callback handler |
@@ -138,6 +139,9 @@ Detailed protocol specs and event cheatsheets for each integration:
 | AMP runner spec | `docs/reference/runners/amp/runner.md` | CLI invocation, stream-json, mode/model selection |
 | AMP stream-json | `docs/reference/runners/amp/stream-json-cheatsheet.md` | JSONL event shapes (`system`, `assistant`, `user`, `result`) |
 | AMP event mapping | `docs/reference/runners/amp/untether-events.md` | AMP JSONL → Untether event translation rules |
+| Antigravity runner spec | `docs/reference/runners/antigravity/runner.md` | CLI invocation, `--output-format json`, resume, capability tier |
+| Antigravity result envelope | `docs/reference/runners/antigravity/stream-json-cheatsheet.md` | Single JSON result envelope (`conversation_id`, `status`, `response`, `usage`) |
+| Antigravity event mapping | `docs/reference/runners/antigravity/untether-events.md` | Envelope → Untether Started/Completed translation rules |
 | Telegram transport | `docs/reference/transports/telegram.md` | Bot API client, outbox/rate-limiting, voice transcription, forum topics |
 | Workflow modes | `docs/reference/modes.md` | Assistant, workspace, handoff — settings, commands, mode-agnostic features |
 
