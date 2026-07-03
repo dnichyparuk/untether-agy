@@ -18,6 +18,7 @@ RESERVED_CHAT_COMMANDS = frozenset(
         "trigger",
         "topic",
         "ctx",
+        "clone",
     }
 )
 RESERVED_ENGINE_IDS = (

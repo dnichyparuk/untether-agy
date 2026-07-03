@@ -375,6 +375,25 @@ class WatchdogSettings(BaseModel):
         return self
 
 
+class CloneSettings(BaseModel):
+    """`/clone` command settings (Task 2 of the clone-command feature).
+
+    ``root`` is the default parent directory new clones land under when the
+    ``--dir`` override is not supplied; ``allowed_hosts`` gates which Git
+    hosts ``parse_repo_url``/``host_is_allowed`` (see
+    ``telegram/clone.py``) will accept for both the https and scp-style
+    (``git@host:owner/repo``) URL forms.
+    """
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    enabled: bool = True
+    root: NonEmptyStr = "~/untether-projects"
+    allowed_hosts: list[NonEmptyStr] = Field(default_factory=lambda: ["github.com"])
+    default_engine: NonEmptyStr = "claude"
+    depth: int = Field(default=1, ge=1)
+
+
 class ProgressSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -470,6 +489,7 @@ class UntetherSettings(BaseSettings):
     watchdog: WatchdogSettings = Field(default_factory=WatchdogSettings)
     auto_continue: AutoContinueSettings = Field(default_factory=AutoContinueSettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
+    clone: CloneSettings = Field(default_factory=CloneSettings)
 
     @model_validator(mode="before")
     @classmethod

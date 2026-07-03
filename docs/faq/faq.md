@@ -34,6 +34,23 @@ The first run launches a setup wizard that creates a Telegram bot via [BotFather
 
 Already have a bot token? Skip the BotFather step with `untether --bot-token YOUR_TOKEN`. Full walkthrough: [Install and onboard](https://untether.littlebearapps.com/tutorials/install/).
 
+## How do I add a new project or repo to Untether?
+
+Two ways. If you already have the repo cloned on the machine Untether runs on, register it from a terminal:
+
+```sh
+cd ~/dev/happy-gadgets
+untether init happy-gadgets
+```
+
+If the repo isn't on the machine yet, send `/clone` from Telegram instead — no terminal needed:
+
+```
+/clone https://github.com/happy-org/happy-gadgets
+```
+
+`/clone` accepts `https://github.com/OWNER/REPO[.git]` and scp-style `git@github.com:OWNER/REPO[.git]` URLs, runs a native `git clone` using your host's existing git credentials, derives a project alias from the repo name, and writes the same `[projects.<alias>]` config entry `untether init` would. In a forum-enabled group chat it goes one step further and creates a topic bound to the new project, so you can start chatting in it immediately. Only hosts listed in `[clone] allowed_hosts` (default just `github.com`) are accepted, and the clone destination is confined to the configured `[clone] root` directory. Full walkthrough: [Projects — bootstrap a repo with /clone](https://github.com/littlebearapps/untether/blob/master/docs/how-to/projects.md#bootstrap-a-repo-from-telegram-with-clone).
+
 ## Which AI coding agents does Untether support?
 
 Untether supports seven agent CLIs out of the box:

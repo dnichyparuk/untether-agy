@@ -29,6 +29,7 @@ from .bridge import CANCEL_CALLBACK_DATA, TelegramBridgeConfig, send_plain
 from .chat_prefs import ChatPrefsStore, resolve_prefs_path
 from .chat_sessions import ChatSessionStore, resolve_sessions_path
 from .client import poll_incoming
+from .clone import handle_clone_command
 from .commands.cancel import handle_callback_cancel, handle_cancel
 from .commands.file_transfer import FILE_PUT_USAGE
 from .commands.handlers import (
@@ -425,6 +426,23 @@ def _dispatch_builtin_command(
         if handler is not None:
             task_group.start_soon(handler)
             return True
+
+    if command_id == "clone":
+        # Top-level branch: clone + project registration must run even when
+        # topics are disabled / this is a private chat, so it lives OUTSIDE
+        # the `cfg.topics.enabled` guard above. Only the topic step inside
+        # handle_clone_command is gated (KD4).
+        handler = partial(
+            handle_clone_command,
+            cfg,
+            msg,
+            args_text,
+            topic_store,
+            resolved_scope=resolved_scope,
+            scope_chat_ids=scope_chat_ids,
+        )
+        task_group.start_soon(handler)
+        return True
 
     if command_id == "model":
         handler = partial(
