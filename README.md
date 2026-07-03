@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  Works with <a href="https://docs.anthropic.com/en/docs/claude-code">Claude Code</a> · <a href="https://github.com/openai/codex">Codex</a> · <a href="https://github.com/opencode-ai/opencode">OpenCode</a> · <a href="https://github.com/nicholasgasior/pi">Pi</a> · <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> · <a href="https://ampcode.com">Amp</a>
+  Works with <a href="https://docs.anthropic.com/en/docs/claude-code">Claude Code</a> · <a href="https://github.com/openai/codex">Codex</a> · <a href="https://github.com/opencode-ai/opencode">OpenCode</a> · <a href="https://github.com/nicholasgasior/pi">Pi</a> · <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> · <a href="https://ampcode.com">Amp</a> · <a href="https://antigravity.google">Antigravity</a>
 </p>
 
 <p align="center">
@@ -22,6 +22,10 @@
 <p align="center">
   <a href="#-quick-start">Quick Start</a> · <a href="#-features">Features</a> · <a href="#-supported-engines">Engines</a> · <a href="#-help-guides">Guides</a> · <a href="#-commands">Commands</a> · <a href="#-contributing">Contributing</a>
 </p>
+
+---
+
+> **Fork note:** This is a fork of the original [littlebearapps/untether](https://github.com/littlebearapps/untether) that **adds support for Google's [Antigravity](https://antigravity.google) CLI (`agy`)** as a coding-agent engine, alongside the engines the upstream project already supports. See the [Antigravity runner reference](docs/reference/runners/antigravity/runner.md) and [configuration](docs/reference/config.md#antigravity) for details. All other functionality tracks upstream.
 
 ---
 
@@ -121,35 +125,36 @@ The wizard offers three **workflow modes** — pick the one that fits:
 | [Pi](https://github.com/mariozechner/pi-coding-agent) | `npm i -g @mariozechner/pi-coding-agent` | Multi-provider auth, conversational |
 | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | `npm i -g @google/gemini-cli` | Google Gemini models, configurable approval mode |
 | [Amp](https://ampcode.com) | `npm i -g @sourcegraph/amp` | Sourcegraph's AI coding agent, mode selection |
+| [Antigravity](https://antigravity.google) | `curl -fsSL https://antigravity.google/cli/install.sh \| bash` | Google's `agy` CLI; non-interactive structured-result runs, keyring/OAuth auth |
 
-**Note:** Use your existing Claude or ChatGPT subscription — no extra API keys needed (unless you want API billing).
+**Note:** Use your existing Claude or ChatGPT subscription — no extra API keys needed (unless you want API billing). Antigravity authenticates via the OS keyring (Google OAuth) — run `agy` once interactively on the host to sign in before headless use.
 
 ### Engine compatibility
 
-| Feature | Claude Code | Codex CLI | OpenCode | Pi | Gemini CLI | Amp |
-|---------|:-----------:|:---------:|:--------:|:--:|:----------:|:---:|
-| **Progress streaming** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Session resume** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Model override** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅¹ |
-| **Model in footer** | ✅ | ✅ | ✅ | — | ✅ | — |
-| **Approval mode in footer** | ✅ | ~⁴ | — | — | ~² | — |
-| **Voice input** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Verbose progress** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Error hints** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Preamble injection** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Cost tracking** | ✅ | ~³ | ✅ | ~³ | ~³ | ~³ |
-| **Interactive permissions** | ✅ | — | — | — | — | — |
-| **Approval policy** | ✅ | ~⁴ | — | — | ~² | — |
-| **Plan mode** | ✅ | — | — | — | — | — |
-| **Ask mode (option buttons)** | ✅ | — | — | — | — | — |
-| **Diff preview** | ✅ | — | — | — | — | — |
-| **Auto-approve safe tools** | ✅ | — | — | — | — | — |
-| **Progressive cooldown** | ✅ | — | — | — | — | — |
-| **Subscription usage** | ✅ | — | — | — | — | — |
-| **Reasoning/effort levels** | ✅ | ✅ | — | — | — | — |
-| **Device re-auth (`/auth`)** | — | ✅ | — | — | — | — |
-| **Context compaction** | — | — | — | ✅ | — | — |
-| **Cross-env resume (`/continue`)** | ✅ | ✅ | ✅ | ✅⁵ | ✅ | —⁶ |
+| Feature | Claude Code | Codex CLI | OpenCode | Pi | Gemini CLI | Amp | Antigravity |
+|---------|:-----------:|:---------:|:--------:|:--:|:----------:|:---:|:-----------:|
+| **Progress streaming** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | —⁷ |
+| **Session resume** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Model override** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅¹ | ✅ |
+| **Model in footer** | ✅ | ✅ | ✅ | — | ✅ | — | ✅⁸ |
+| **Approval mode in footer** | ✅ | ~⁴ | — | — | ~² | — | ✅ |
+| **Voice input** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Verbose progress** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | —⁷ |
+| **Error hints** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Preamble injection** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Cost tracking** | ✅ | ~³ | ✅ | ~³ | ~³ | ~³ | ~³ |
+| **Interactive permissions** | ✅ | — | — | — | — | — | — |
+| **Approval policy** | ✅ | ~⁴ | — | — | ~² | — | —⁹ |
+| **Plan mode** | ✅ | — | — | — | — | — | — |
+| **Ask mode (option buttons)** | ✅ | — | — | — | — | — | — |
+| **Diff preview** | ✅ | — | — | — | — | — | — |
+| **Auto-approve safe tools** | ✅ | — | — | — | — | — | — |
+| **Progressive cooldown** | ✅ | — | — | — | — | — | — |
+| **Subscription usage** | ✅ | — | — | — | — | — | — |
+| **Reasoning/effort levels** | ✅ | ✅ | — | — | — | — | —¹⁰ |
+| **Device re-auth (`/auth`)** | — | ✅ | — | — | — | — | — |
+| **Context compaction** | — | — | — | ✅ | — | — | — |
+| **Cross-env resume (`/continue`)** | ✅ | ✅ | ✅ | ✅⁵ | ✅ | —⁶ | ✅¹¹ |
 
 ¹ Amp model override maps to `--mode` (deep/free/rush/smart).
 ² Defaults to full access (`--approval-mode=yolo`, all tools auto-approved); toggle via `/config` to edit files (`auto_edit`, files OK but no shell) or read-only; pre-run policy, not interactive mid-run approval.
@@ -157,6 +162,11 @@ The wizard offers three **workflow modes** — pick the one that fits:
 ⁴ Toggle via `/config` between full auto (default) and safe (`--ask-for-approval=untrusted`, untrusted tools blocked); pre-run policy, not interactive mid-run approval.
 ⁵ Pi requires `provider = "openai-codex"` in engine config for OAuth subscriptions in headless mode.
 ⁶ AMP requires an explicit thread ID; no "most recent" mode.
+⁷ Antigravity returns a single result envelope at completion (no intermediate event stream), so the message shows "working…" then the final answer — no live or verbose progress.
+⁸ The result envelope has no model field and `agy` silently ignores an invalid `--model`, so the footer reflects the *configured* model.
+⁹ Permission stance (`auto_approve` / `sandbox`) is fixed at spawn time via config — `agy` has no interactive approval channel through Untether.
+¹⁰ The reasoning tier is baked into the model name (e.g. `Gemini 3.1 Pro (High)`); there is no separate effort flag.
+¹¹ `agy --continue` resumes the machine-most-recent conversation (machine-global, not per-project); per-session resume via the message footer is preferred.
 
 Claude effort levels: `low`, `medium`, `high`, `xhigh`, `max` (`xhigh` requires Claude Code v2.1.114+).
 
