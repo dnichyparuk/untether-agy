@@ -225,6 +225,17 @@ session_mode = "chat"
 path = "~/dev/myapp"
 default_engine = "claude"
 
+# `/clone <repo-url>` — clone a GitHub repo from Telegram and auto-register it
+[clone]
+enabled = true
+root = "~/untether-projects"
+allowed_hosts = ["github.com"]
+
+# `/project <name>` — register a brand-new empty local project from Telegram
+[new_project]
+enabled = true
+root = "~/untether-projects"
+
 [cost_budget]
 enabled = true
 max_cost_per_run = 2.00
