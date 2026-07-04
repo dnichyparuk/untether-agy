@@ -124,7 +124,9 @@ def parse_repo_url(
         if not host_is_allowed(host, allowed_hosts):
             raise ValueError(f"host not allowed: {host}")
         normalised = f"https://{host}/{owner}/{repo}.git"
-        return RepoRef(host=host, owner=owner, repo=repo, url=normalised, scheme="https")
+        return RepoRef(
+            host=host, owner=owner, repo=repo, url=normalised, scheme="https"
+        )
 
     match = _SCP_RE.match(candidate)
     if match is not None:
@@ -139,22 +141,37 @@ def parse_repo_url(
     raise ValueError(f"unsupported or unsafe repo URL: {url!r}")
 
 
+def sanitize_alias(name: str) -> str:
+    """Sanitise *name* to :data:`untether.ids.ID_PATTERN` (``^[a-z0-9_]{1,32}$``).
+
+    Lowercases *name*, replaces every character outside ``[a-z0-9_]`` with
+    ``_``, strips leading/trailing underscores, and truncates to 32 chars.
+    Raises :class:`ValueError` when nothing valid remains (empty input or an
+    input made entirely of punctuation / separators) — the caller decides how
+    to handle that: :func:`derive_alias` falls back to ``"repo"``, while
+    ``new_project.handle_project_command`` surfaces the rejection to the user.
+    """
+    lowered = name.lower()
+    sanitised = re.sub(r"[^a-z0-9_]", "_", lowered)
+    sanitised = sanitised.strip("_")[:_MAX_ALIAS_LENGTH]
+    if not sanitised or not _ID_RE.fullmatch(sanitised):
+        raise ValueError(f"cannot derive a valid project alias from {name!r}")
+    return sanitised
+
+
 def derive_alias(ref: RepoRef, existing: set[str]) -> str:
     """Derive a project alias from a repo name, deduped against *existing*.
 
-    The alias is sanitised to :data:`untether.ids.ID_PATTERN`
-    (``^[a-z0-9_]{1,32}$``): lowercased, non-matching characters replaced
-    with ``_``, leading/trailing underscores stripped, truncated to 32
-    chars, and falls back to ``"repo"`` if that leaves nothing. If the
-    resulting alias collides with one in *existing*, a numeric suffix
-    (``_1``, ``_2``, ...) is appended (and the base is re-truncated so the
-    32-char cap still holds).
+    The alias is sanitised via :func:`sanitize_alias` (lowercased, non-matching
+    characters replaced with ``_``, leading/trailing underscores stripped,
+    truncated to 32 chars), and falls back to ``"repo"`` if sanitisation
+    rejects the name (nothing valid left). If the resulting alias collides with
+    one in *existing*, a numeric suffix (``_1``, ``_2``, ...) is appended (and
+    the base is re-truncated so the 32-char cap still holds).
     """
-    lowered = ref.repo.lower()
-    sanitised = re.sub(r"[^a-z0-9_]", "_", lowered)
-    sanitised = sanitised.strip("_")[:_MAX_ALIAS_LENGTH]
-    base = sanitised or "repo"
-    if not _ID_RE.fullmatch(base):
+    try:
+        base = sanitize_alias(ref.repo)
+    except ValueError:
         base = "repo"
 
     if base not in existing:
@@ -535,6 +552,46 @@ async def handle_clone_command(
 
     # TOPIC STEP — gated; best-effort; never hard-fails the command.
     context = RunContext(project=alias, branch=branch)
+    title = await create_and_bind_topic(
+        cfg,
+        msg,
+        context,
+        topic_store,
+        resolved_scope=resolved_scope,
+        scope_chat_ids=scope_chat_ids,
+    )
+    if title is None:
+        await reply(text=_register_only_reply(alias, branch))
+        return
+    await reply(text=f"cloned + registered `{alias}`; created topic `{title}`.")
+
+
+async def create_and_bind_topic(
+    cfg: TelegramBridgeConfig,
+    msg: TelegramIncomingMessage,
+    context: RunContext,
+    topic_store: TopicStateStore | None,
+    *,
+    resolved_scope: str | None,
+    scope_chat_ids: frozenset[int] | None,
+) -> str | None:
+    """Create a forum topic for *context* and bind it, best-effort.
+
+    Shared tail of ``/clone`` and ``/project``. The step is gated on
+    ``cfg.topics.enabled``, an available *topic_store*, and the chat being a
+    topics-enabled forum in scope; if any gate fails it returns ``None``
+    without touching the Telegram API. On success it pins *context* via
+    ``topic_store.set_context`` and sends the "topic bound to ..." confirmation
+    into the freshly-created thread, then returns the created topic title.
+
+    It NEVER raises (KD4): any failure from ``create_forum_topic`` /
+    ``set_context`` — Telegram API error, network error, store I/O error, or a
+    ``create_forum_topic`` that returns ``None`` because the chat isn't
+    actually a forum — degrades to a ``None`` return so the caller can fall
+    back to a register-only reply. The caller owns the top-level success reply
+    (``/clone`` and ``/project`` phrase their own confirmation), so this helper
+    deliberately does not send it.
+    """
     if (
         not cfg.topics.enabled
         or topic_store is None
@@ -546,15 +603,13 @@ async def handle_clone_command(
         )
         is not None
     ):
-        await reply(text=_register_only_reply(alias, branch))
-        return
+        return None
 
     title = _topic_title(runtime=cfg.runtime, context=context)
     try:
         created = await cfg.bot.create_forum_topic(msg.chat_id, title)
         if created is None:
-            await reply(text=_register_only_reply(alias, branch))
-            return
+            return None
         thread_id = created.message_thread_id
         await topic_store.set_context(
             msg.chat_id,
@@ -562,26 +617,26 @@ async def handle_clone_command(
             context,
             topic_title=title,
         )
-        await reply(text=f"cloned + registered `{alias}`; created topic `{title}`.")
-        branch_note = f" @{branch}" if branch else ""
-        bound_text = f"topic bound to `{alias}`{branch_note}"
+        branch_note = f" @{context.branch}" if context.branch else ""
+        bound_text = f"topic bound to `{context.project}`{branch_note}"
         rendered_text, entities = prepare_telegram(MarkdownParts(header=bound_text))
         await cfg.exec_cfg.transport.send(
             channel_id=msg.chat_id,
             message=RenderedMessage(text=rendered_text, extra={"entities": entities}),
             options=SendOptions(thread_id=thread_id),
         )
+        return title
     except Exception as exc:  # noqa: BLE001 — intentionally broad: the
         # topic step is best-effort (see the "NEVER hard-fails" contract in
         # this function's docstring / KD4). Any failure from create_forum_topic
         # or set_context — Telegram API error, network error, or a store
-        # I/O error — degrades to the same register-only reply rather than
-        # risking a raise that would abort an already-successful clone.
+        # I/O error — degrades to a None return rather than risking a raise
+        # that would abort an already-successful clone/registration.
         logger.warning(
             "clone.topic.failed",
             chat_id=msg.chat_id,
-            alias=alias,
+            alias=context.project,
             error=str(exc),
             error_type=exc.__class__.__name__,
         )
-        await reply(text=_register_only_reply(alias, branch))
+        return None

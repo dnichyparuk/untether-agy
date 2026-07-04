@@ -15,6 +15,7 @@ from ..runner_bridge import ExecBridgeConfig, RunningTask, RunningTasks
 from ..scheduler import ThreadScheduler
 from ..settings import (
     CloneSettings,
+    NewProjectSettings,
     TelegramFilesSettings,
     TelegramTopicsSettings,
     TelegramTransportSettings,
@@ -197,6 +198,10 @@ class TelegramBridgeConfig:
     # here so the loop.py-routed clone handler can reach clone.root /
     # allowed_hosts / default_engine / depth without re-reading config.
     clone: CloneSettings = field(default_factory=CloneSettings)
+    # `/project` command settings (`[new_project]` in untether.toml). Same
+    # rationale as `clone` above — threaded in so the loop.py-routed project
+    # handler can reach new_project.root without re-reading config.
+    new_project: NewProjectSettings = field(default_factory=NewProjectSettings)
     trigger_config: dict | None = None
     # rc4 (#269/#285): trigger_manager is assigned after construction once the
     # trigger settings have been parsed; commands read it via CommandContext.

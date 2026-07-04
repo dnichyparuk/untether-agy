@@ -402,6 +402,16 @@ class CloneSettings(BaseModel):
     depth: int = Field(default=1, ge=1)
 
 
+class NewProjectSettings(BaseModel):
+    """`/project` command settings — register a new local project (no git clone)."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    enabled: bool = True
+    root: NonEmptyStr = "~/untether-projects"
+    default_engine: NonEmptyStr | None = None
+
+
 class ProgressSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -498,6 +508,7 @@ class UntetherSettings(BaseSettings):
     auto_continue: AutoContinueSettings = Field(default_factory=AutoContinueSettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     clone: CloneSettings = Field(default_factory=CloneSettings)
+    new_project: NewProjectSettings = Field(default_factory=NewProjectSettings)
 
     @model_validator(mode="before")
     @classmethod

@@ -95,6 +95,7 @@ The wizard offers three **workflow modes** — pick the one that fits:
 - 📋 **Plan mode** — toggle per chat with `/planmode`; choose full manual approval, auto-approved transitions, or no plan phase
 - 📁 **Projects and worktrees** — register repos with `untether init`, target with `/myproject @feat/thing`, run branches in isolated worktrees in parallel
 - 🌱 **Clone from Telegram** — `/clone <repo-url> [--dir <path>] [@<branch>]` clones a GitHub repo with native git, auto-registers it as a project, and (in a forum-enabled group) creates a topic bound to it — no terminal round-trip needed to onboard a new repo
+- 🌱 **New project from Telegram** — `/project <name>` creates an empty local project directory, auto-registers it, and (in a forum-enabled group) creates a topic bound to it — for starting a brand-new project without cloning a repo
 - 💰 **Cost and usage tracking** — run agents remotely with confidence; per-run and daily budgets, `/usage` breakdowns, and optional auto-cancel keep spending visible
 - 💡 **Actionable error hints** — friendly messages for API outages, rate limits, billing errors, and network failures with resume guidance
 - 🏷 **Model and mode metadata** — every completed message shows model with version, effort level, and permission mode (e.g. `🏷 opus 4.6 · medium · plan`) across all engines
@@ -185,6 +186,7 @@ Claude effort levels: `low`, `medium`, `high`, `xhigh`, `max` (`xhigh` requires 
 | `/export` | Export session transcript |
 | `/browse` | Browse project files |
 | `/clone <repo-url> [--dir <path>] [@<branch>]` | Clone a GitHub repo and auto-register it as a project; in a forum-enabled group it also creates a topic bound to the new project ([guide](docs/how-to/projects.md#bootstrap-a-repo-from-telegram-with-clone)) |
+| `/project <name>` | Create an empty local project directory and auto-register it; in a forum-enabled group it also creates a topic bound to the new project |
 | `/new` | Cancel running tasks and clear stored sessions |
 | `/continue` | Resume the most recent CLI session in this project ([guide](docs/how-to/cross-environment-resume.md)) |
 | `/file put/get` | Transfer files |
