@@ -19,8 +19,10 @@ The pure helpers and orchestration mirror :mod:`untether.telegram.clone`:
   best-effort forum-topic create+bind shared with ``/clone``.
 
 ``[new_project]`` settings live on the top-level :class:`UntetherSettings`
-(like ``[clone]``), so they are read fresh from ``cfg.runtime.config_path``
-rather than off the transport config.
+(like ``[clone]``); they are threaded onto :class:`TelegramBridgeConfig` as
+``cfg.new_project`` at startup and hot-reloaded in place, so the handler reads
+them from ``cfg.new_project`` (mirroring how ``/clone`` reads ``cfg.clone``)
+rather than re-reading the config file on each invocation.
 """
 
 from __future__ import annotations
@@ -31,7 +33,6 @@ from typing import TYPE_CHECKING
 from ..config import ConfigError
 from ..context import RunContext
 from ..logging import get_logger
-from ..settings import NewProjectSettings, load_settings
 from . import clone
 from .commands.reply import make_reply
 from .topic_state import TopicStateStore
@@ -69,19 +70,6 @@ def resolve_project_path(name_alias: str, root: Path) -> Path:
         ) from None
 
     return destination
-
-
-def _load_new_project_settings(config_path: Path) -> NewProjectSettings:
-    """Read ``[new_project]`` settings from *config_path*.
-
-    ``[new_project]`` lives on the top-level :class:`UntetherSettings`, not on
-    ``[transports.telegram]``, so it isn't carried on the
-    :class:`TelegramBridgeConfig`. Load it from the config file the runtime was
-    built against (already validated at startup, so this re-read is cheap and
-    can't introduce a new failure the runtime didn't already survive).
-    """
-    settings, _ = load_settings(config_path)
-    return settings.new_project
 
 
 def _register_only_reply(alias: str) -> str:
@@ -122,7 +110,10 @@ async def handle_project_command(
         await reply(text="cannot register project: no config path available.")
         return
 
-    np_cfg = _load_new_project_settings(config_path)
+    # Read from the threaded, hot-reloaded copy on TelegramBridgeConfig, exactly
+    # as `/clone` reads `cfg.clone` — no per-invocation config-file re-read (which
+    # would also raise if the on-disk config went invalid after startup).
+    np_cfg = cfg.new_project
     if not np_cfg.enabled:
         await reply(text="/project is disabled in this deployment.")
         return
@@ -154,6 +145,15 @@ async def handle_project_command(
         dest = resolve_project_path(alias, root)
     except ValueError as exc:
         await reply(text=f"error: {exc}")
+        return
+
+    # Refuse to adopt a pre-existing non-empty directory (or a non-directory
+    # path) at the destination, mirroring `/clone`'s guard: the alias check
+    # above only catches *registered* projects, so an unregistered directory
+    # with contents would otherwise be silently claimed as a "new" project.
+    conflict = clone._destination_conflict(dest)
+    if conflict is not None:
+        await reply(text=f"error: {conflict}")
         return
 
     try:

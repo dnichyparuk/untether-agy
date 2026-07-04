@@ -298,11 +298,16 @@ def _orch_cfg(
     runtime = _build_runtime(config_path, monkeypatch)
     transport = FakeTransport()
     bot = _ProjectFakeBot(topic_result)
+    # The handler reads `[new_project]` from cfg.new_project (threaded on the
+    # bridge config + hot-reloaded), not from disk — so mirror the startup wiring
+    # here by loading the same settings the runtime was built from.
+    settings, _ = load_settings(config_path)
     cfg = replace(
         make_cfg(transport),
         runtime=runtime,
         bot=bot,
         topics=TelegramTopicsSettings(enabled=topics_enabled, scope="all"),
+        new_project=settings.new_project,
     )
     return cfg, transport, bot, config_path
 
@@ -419,6 +424,36 @@ class TestHandleProjectCommand:
         # No topic step attempted; register-only reply.
         assert bot.create_topic_calls == []
         assert "run /topic foo" in transport.send_calls[-1]["message"].text
+
+    async def test_existing_nonempty_dir_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unregistered but non-empty destination dir is refused, not adopted."""
+        clone_root = tmp_path / "projects"
+        cfg, transport, bot, config_path = _orch_cfg(
+            tmp_path,
+            monkeypatch,
+            topics_enabled=False,
+            topic_result=None,
+            new_project_block=f'\n[new_project]\nroot = "{clone_root}"\n',
+        )
+        # Pre-create <root>/foo with contents but NEVER register it as a project.
+        existing = clone_root / "foo"
+        existing.mkdir(parents=True)
+        (existing / "keep.txt").write_text("x", encoding="utf-8")
+
+        await handle_project_command(
+            cfg,
+            _project_msg("/project foo", chat_type="private"),
+            args_text="foo",
+            topic_store=None,
+        )
+
+        assert "not empty" in transport.send_calls[-1]["message"].text
+        # Nothing registered; the pre-existing file is left untouched.
+        assert "foo" not in read_config(config_path).get("projects", {})
+        assert "foo" not in cfg.runtime.project_aliases()
+        assert (existing / "keep.txt").read_text(encoding="utf-8") == "x"
 
     async def test_success_creates_and_binds_topic(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

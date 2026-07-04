@@ -239,6 +239,8 @@ Key test files:
 - `test_at_command.py` — 34 tests: `/at` parse (valid/invalid suffixes, bounds, case-insensitive), `_format_delay`, schedule/cancel, per-chat cap, scheduler install/uninstall
 - `test_offset_persistence.py` — 15 tests: Telegram update_id round-trip, corrupt JSON handling, atomic write, `DebouncedOffsetWriter` interval/max-pending semantics, explicit flush
 - `test_sdnotify.py` — 7 tests: NOTIFY_SOCKET handling (absent/empty/filesystem/abstract-namespace), send error swallowing, UTF-8 encoding
+- `test_clone_command.py` — 95 tests: `/clone` URL parsing (https/scp, host allowlist, unsafe segments), alias derivation + dedup, destination confinement, `git clone` subprocess outcomes, project registration, dispatcher concurrency guard, hot-reload, command-menu inclusion
+- `test_project_command.py` — 48 tests: `NewProjectSettings` validation/defaults, `sanitize_alias`/`derive_alias` edge cases, `resolve_project_path` traversal/symlink confinement, `handle_project_command` orchestration (disabled, invalid name, alias-collision refusal, non-empty-dest refusal, register-only + topic-bound paths, degrade-to-register-only, write failures), dispatcher concurrency guards, `[new_project]` hot-reload, command-menu inclusion
 
 ## Development
 
