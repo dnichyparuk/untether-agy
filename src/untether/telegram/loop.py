@@ -22,7 +22,7 @@ from ..model import EngineId, ResumeToken
 from ..progress import ProgressTracker
 from ..runners.run_options import EngineRunOptions
 from ..scheduler import ThreadJob, ThreadScheduler
-from ..settings import CloneSettings, TelegramTransportSettings
+from ..settings import CloneSettings, NewProjectSettings, TelegramTransportSettings
 from ..transport import MessageRef, RenderedMessage, SendOptions
 from ..transport_runtime import ResolvedMessage
 from .bridge import CANCEL_CALLBACK_DATA, TelegramBridgeConfig, send_plain
@@ -61,6 +61,7 @@ from .context import _merge_topic_context, _usage_ctx_set, _usage_topic
 from .engine_defaults import resolve_engine_for_message
 from .engine_overrides import merge_overrides
 from .listen_mode import resolve_listen_mode, should_trigger_run
+from .new_project import handle_project_command
 from .topic_state import TopicStateStore, resolve_state_path
 from .topics import (
     _maybe_rename_topic,
@@ -395,6 +396,89 @@ def _apply_clone_hot_reload(
     return False
 
 
+async def _run_project_command_tracked(
+    cfg: TelegramBridgeConfig,
+    msg: TelegramIncomingMessage,
+    args_text: str,
+    topic_store: TopicStateStore | None,
+    *,
+    running_tasks: RunningTasks | None,
+    running_task: RunningTask | None,
+    resolved_scope: str | None,
+    scope_chat_ids: frozenset[int],
+) -> None:
+    """Run ``/project`` registered in *running_tasks* for its full duration.
+
+    ``/project`` runs no subprocess (unlike ``/clone``'s ``git clone``) —
+    just a sanitise -> collide -> mkdir -> register -> topic-step sequence —
+    but it is still registered as a tracked :class:`~untether.runner_bridge.RunningTask`
+    for the same reasons ``/clone`` is: it lets ``_cancel_chat_tasks()``
+    (``/new``) see the in-flight registration and lets ``_drain_and_exit()``
+    wait for it instead of hard-cancelling mid-mkdir/mid-write during a
+    graceful restart. The incoming command message doubles as the
+    :class:`~untether.transport.MessageRef` it's keyed on, exactly as
+    ``/clone`` does.
+
+    The *running_task* entry is created and registered **synchronously by
+    the dispatcher** (``_dispatch_builtin_command``) *before* this coroutine
+    is scheduled — not here — so the "a run is already in progress" guard and
+    the registration are atomic with respect to a double-send arriving in the
+    same ``poll_incoming`` batch (no ``await`` between the guard check and the
+    registration). This coroutine owns only the *cleanup* half of that
+    lifecycle (the ``finally`` below).
+
+    A user can also reply directly to the ``/project`` command message while
+    it's running; ``ResumeResolver.resolve()`` looks up *running_tasks* by
+    the replied-to :class:`~untether.transport.MessageRef` for ANY entry
+    (agent or not) and spawns ``send_with_resume``, which blocks on
+    ``running_task.resume_ready``/``running_task.done``. A plain
+    ``RunningTask()`` never sets ``resume_ready`` (project registration has no
+    resume token), so ``done`` is set in the ``finally`` below to unblock that
+    waiter with ``resume=None`` (it falls back to a "not ready yet" reply)
+    instead of hanging until process shutdown.
+    """
+    ref = MessageRef(channel_id=msg.chat_id, message_id=msg.message_id)
+    try:
+        await handle_project_command(
+            cfg,
+            msg,
+            args_text,
+            topic_store,
+            resolved_scope=resolved_scope,
+            scope_chat_ids=scope_chat_ids,
+        )
+    finally:
+        if running_tasks is not None:
+            running_tasks.pop(ref, None)
+        if running_task is not None:
+            running_task.done.set()
+
+
+def _apply_new_project_hot_reload(
+    cfg: TelegramBridgeConfig, new_settings: NewProjectSettings
+) -> bool:
+    """Apply reloaded ``[new_project]`` settings to *cfg* in place; return whether changed.
+
+    ``[new_project]`` lives on the top-level ``UntetherSettings`` (like
+    ``[clone]``), not under ``[transports.telegram]``, so it never
+    participates in the transport_snapshot diff / ``RESTART_REQUIRED_FIELDS``
+    logic in ``handle_reload``. Every :class:`NewProjectSettings` field is
+    read fresh by ``handle_project_command`` on each invocation via
+    ``cfg.new_project`` with no long-lived state keyed off it, so a plain
+    reassignment is safe — no restart-required subset needed, mirroring
+    ``_apply_clone_hot_reload``.
+
+    Extracted from the ``handle_reload`` closure so the reassign-on-change
+    behavior is unit-testable. Returns ``True`` when the settings differed and
+    ``cfg.new_project`` was updated, ``False`` when they were already equal
+    (no-op).
+    """
+    if new_settings != cfg.new_project:
+        cfg.new_project = new_settings
+        return True
+    return False
+
+
 def _dispatch_builtin_command(
     *,
     ctx: TelegramCommandContext,
@@ -544,6 +628,48 @@ def _dispatch_builtin_command(
                 ] = running_task
             handler = partial(
                 _run_clone_command_tracked,
+                cfg,
+                msg,
+                args_text,
+                topic_store,
+                running_tasks=ctx.running_tasks,
+                running_task=running_task,
+                resolved_scope=resolved_scope,
+                scope_chat_ids=scope_chat_ids,
+            )
+        task_group.start_soon(handler)
+        return True
+
+    if command_id == "project":
+        # Top-level branch: project registration must run even when topics
+        # are disabled / this is a private chat, so it lives OUTSIDE the
+        # `cfg.topics.enabled` guard above. Only the topic step inside
+        # handle_project_command is gated (KD4), mirroring `/clone`.
+        if ctx.running_tasks is not None and any(
+            ref.channel_id == msg.chat_id for ref in ctx.running_tasks
+        ):
+            # Guard against a double-send/retry starting a second concurrent
+            # mkdir + project-registration flow that could race on the same
+            # destination directory or `[projects.<alias>]` TOML section.
+            handler = partial(
+                reply,
+                text="a run is already in progress for this chat; wait for it to finish.",
+            )
+        else:
+            # Register the RunningTask entry SYNCHRONOUSLY here, before
+            # `start_soon`, rather than inside the scheduled coroutine —
+            # mirrors the `/clone` branch above so the TOCTOU window is
+            # closed the same way.
+            running_task = None
+            if ctx.running_tasks is not None:
+                from ..runner_bridge import RunningTask
+
+                running_task = RunningTask()
+                ctx.running_tasks[
+                    MessageRef(channel_id=msg.chat_id, message_id=msg.message_id)
+                ] = running_task
+            handler = partial(
+                _run_project_command_tracked,
                 cfg,
                 msg,
                 args_text,
@@ -1706,6 +1832,10 @@ async def run_main_loop(
                 # --- Hot-reload [clone] settings ---
                 if _apply_clone_hot_reload(cfg, reload.settings.clone):
                     logger.info("config.reload.clone_settings_applied")
+
+                # --- Hot-reload [new_project] settings ---
+                if _apply_new_project_hot_reload(cfg, reload.settings.new_project):
+                    logger.info("config.reload.new_project_settings_applied")
 
             if watch_enabled and config_path is not None:
 

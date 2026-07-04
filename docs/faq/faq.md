@@ -36,7 +36,7 @@ Already have a bot token? Skip the BotFather step with `untether --bot-token YOU
 
 ## How do I add a new project or repo to Untether?
 
-Two ways. If you already have the repo cloned on the machine Untether runs on, register it from a terminal:
+Three ways. If you already have the repo cloned on the machine Untether runs on, register it from a terminal:
 
 ```sh
 cd ~/dev/happy-gadgets
@@ -50,6 +50,14 @@ If the repo isn't on the machine yet, send `/clone` from Telegram instead — no
 ```
 
 `/clone` accepts `https://github.com/OWNER/REPO[.git]` and scp-style `git@github.com:OWNER/REPO[.git]` URLs, runs a native `git clone` using your host's existing git credentials, derives a project alias from the repo name, and writes the same `[projects.<alias>]` config entry `untether init` would. In a forum-enabled group chat it goes one step further and creates a topic bound to the new project, so you can start chatting in it immediately. Only hosts listed in `[clone] allowed_hosts` (default just `github.com`) are accepted, and the clone destination is confined to the configured `[clone] root` directory. Full walkthrough: [Projects — bootstrap a repo with /clone](https://github.com/littlebearapps/untether/blob/master/docs/how-to/projects.md#bootstrap-a-repo-from-telegram-with-clone).
+
+If you're starting a brand-new project with no repo at all, send `/project` instead:
+
+```
+/project happy-gadgets
+```
+
+`/project` sanitizes the name into an alias, creates an empty directory under the configured `[new_project] root`, and writes the same `[projects.<alias>]` config entry `untether init` would. Unlike `/clone` it doesn't dedupe the alias — if one already exists it refuses and tells you the existing path. In a forum-enabled group chat it also creates a topic bound to the new project.
 
 ## Which AI coding agents does Untether support?
 

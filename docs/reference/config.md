@@ -181,6 +181,27 @@ Settings for the `/clone` command — cloning a GitHub repo from Telegram and au
 
 Host git credentials (existing SSH keys, credential helpers) are used as-is — v1 does no token injection, and `GIT_TERMINAL_PROMPT=0` / a batch-mode `GIT_SSH_COMMAND` make an auth-required clone fail fast instead of hanging on a prompt.
 
+## `new_project`
+
+Settings for the `/project` command — registering a brand-new *empty* local project from Telegram (no `git clone`) as a `projects.<alias>` entry (see above). See [commands-and-directives.md](commands-and-directives.md) for the `/project` grammar and behaviour, and [Projects: bootstrap a new project with /project](../how-to/projects.md#bootstrap-a-new-project-from-telegram-with-project) for a walkthrough.
+
+=== "toml"
+
+    ```toml
+    [new_project]
+    enabled = true
+    root = "~/untether-projects"
+    # default_engine unset → new projects inherit the global default_engine
+    ```
+
+| Key | Type | Default | Notes |
+|-----|------|---------|-------|
+| `enabled` | bool | `true` | Enable the `/project` command. Set `false` to disable it entirely. |
+| `root` | string | `"~/untether-projects"` | Parent directory the new (empty) project directory is created under, as `<root>/<alias>` (expands `~`). There is no `--dir` override in v1, so every new project lands directly under this root. |
+| `default_engine` | string\|null | `null` | Engine written into the new project's `default_engine` field at registration time. **When unset (`null`, the default), no engine is pinned** and the new project inherits the global top-level `default_engine`. Set it explicitly only to force every `/project` registration onto a specific engine regardless of the global default. |
+
+Unlike `/clone`, `/project` does not dedupe the alias: if the requested name already maps to a registered project, the command refuses and reports the existing path rather than registering a numeric-suffixed variant.
+
 ## Plugins
 
 ### `plugins.enabled`

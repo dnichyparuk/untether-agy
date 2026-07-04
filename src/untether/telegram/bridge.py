@@ -15,6 +15,7 @@ from ..runner_bridge import ExecBridgeConfig, RunningTask, RunningTasks
 from ..scheduler import ThreadScheduler
 from ..settings import (
     CloneSettings,
+    NewProjectSettings,
     TelegramFilesSettings,
     TelegramTopicsSettings,
     TelegramTransportSettings,
@@ -161,12 +162,13 @@ class TelegramBridgeConfig:
     settings hot-reload path. Use :meth:`update_from` to apply reloaded
     transport settings.
 
-    ``clone`` (the ``[clone]`` command settings) is not a transport-settings
-    field, so it is outside :meth:`update_from`; it is instead hot-reloaded
-    by a dedicated branch in ``telegram/loop.py``'s ``handle_reload`` (direct
-    reassignment, mirroring the ``[triggers]`` precedent) since ``[clone]``
-    lives on the top-level ``UntetherSettings`` rather than under
-    ``[transports.telegram]``.
+    ``clone`` (the ``[clone]`` command settings) and ``new_project`` (the
+    ``[new_project]`` settings for ``/project``) are not transport-settings
+    fields, so they are outside :meth:`update_from`; each is instead
+    hot-reloaded by a dedicated branch in ``telegram/loop.py``'s
+    ``handle_reload`` (direct reassignment, mirroring the ``[triggers]``
+    precedent) since both live on the top-level ``UntetherSettings`` rather
+    than under ``[transports.telegram]``.
     """
 
     bot: BotClient
@@ -197,6 +199,10 @@ class TelegramBridgeConfig:
     # here so the loop.py-routed clone handler can reach clone.root /
     # allowed_hosts / default_engine / depth without re-reading config.
     clone: CloneSettings = field(default_factory=CloneSettings)
+    # `/project` command settings (`[new_project]` in untether.toml). Same
+    # rationale as `clone` above — threaded in so the loop.py-routed project
+    # handler can reach new_project.root without re-reading config.
+    new_project: NewProjectSettings = field(default_factory=NewProjectSettings)
     trigger_config: dict | None = None
     # rc4 (#269/#285): trigger_manager is assigned after construction once the
     # trigger settings have been parsed; commands read it via CommandContext.
