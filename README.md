@@ -186,7 +186,7 @@ Claude effort levels: `low`, `medium`, `high`, `xhigh`, `max` (`xhigh` requires 
 | `/export` | Export session transcript |
 | `/browse` | Browse project files |
 | `/clone <repo-url> [--dir <path>] [@<branch>]` | Clone a GitHub repo and auto-register it as a project; in a forum-enabled group it also creates a topic bound to the new project ([guide](docs/how-to/projects.md#bootstrap-a-repo-from-telegram-with-clone)) |
-| `/project <name>` | Create an empty local project directory and auto-register it; in a forum-enabled group it also creates a topic bound to the new project |
+| `/project <name>` | Create an empty local project directory and auto-register it; in a forum-enabled group it also creates a topic bound to the new project ([guide](docs/how-to/projects.md#bootstrap-a-new-project-from-telegram-with-project)) |
 | `/new` | Cancel running tasks and clear stored sessions |
 | `/continue` | Resume the most recent CLI session in this project ([guide](docs/how-to/cross-environment-resume.md)) |
 | `/file put/get` | Transfer files |
