@@ -219,6 +219,66 @@ class TestHandlePrintTimeout:
         assert "removed" in text
         assert "20m" in text  # global default now in effect
 
+    async def test_non_admin_denied_for_set_and_clear(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg, transport, config_path = _cfg(tmp_path, monkeypatch)
+
+        async def _non_admin_member(chat_id: int, user_id: int):
+            _ = chat_id, user_id
+            from untether.telegram.api_schemas import ChatMember
+
+            return ChatMember(status="member")
+
+        monkeypatch.setattr(cfg.bot, "get_chat_member", _non_admin_member)
+
+        await handle_print_timeout_command(
+            cfg,
+            _msg("/printtimeout 30m"),
+            args_text="30m",
+            ambient_context=RunContext(project="foo"),
+            topic_store=None,
+            chat_prefs=None,
+        )
+        assert "print_timeout" not in read_config(config_path)["projects"]["foo"]
+        assert "restricted to group admins" in _last_text(transport)
+
+        await handle_print_timeout_command(
+            cfg,
+            _msg("/printtimeout clear"),
+            args_text="clear",
+            ambient_context=RunContext(project="foo"),
+            topic_store=None,
+            chat_prefs=None,
+        )
+        assert "restricted to group admins" in _last_text(transport)
+
+    async def test_non_admin_allowed_for_show(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg, transport, _ = _cfg(tmp_path, monkeypatch)
+
+        async def _non_admin_member(chat_id: int, user_id: int):
+            _ = chat_id, user_id
+            from untether.telegram.api_schemas import ChatMember
+
+            return ChatMember(status="member")
+
+        monkeypatch.setattr(cfg.bot, "get_chat_member", _non_admin_member)
+
+        await handle_print_timeout_command(
+            cfg,
+            _msg("/printtimeout"),
+            args_text="",
+            ambient_context=RunContext(project="foo"),
+            topic_store=None,
+            chat_prefs=None,
+        )
+
+        text = _last_text(transport)
+        assert "ℹ️" in text
+        assert "20m" in text
+
     async def test_invalid_duration_replies_usage_and_writes_nothing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

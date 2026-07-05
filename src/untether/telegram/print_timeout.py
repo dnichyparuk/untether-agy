@@ -37,6 +37,7 @@ from ..runners.antigravity import ENGINE as _ANTIGRAVITY_ENGINE
 from ..runtime_loader import build_runtime_spec
 from ..settings import validate_settings_data
 from .chat_prefs import ChatPrefsStore
+from .commands.overrides import require_admin_or_private
 from .commands.reply import make_reply
 from .topic_state import TopicStateStore
 from .types import TelegramIncomingMessage
@@ -145,6 +146,18 @@ async def handle_print_timeout_command(
                 f"global default: **{global_default}**"
             )
         )
+        return
+
+    # Mutating branches (clear/set) require admin-or-private, matching /model
+    # and /reasoning — the closest analogues that also persist per-project
+    # config overrides. The read-only "show" branch above is not gated.
+    if not await require_admin_or_private(
+        cfg,
+        msg,
+        missing_sender="cannot verify sender for print_timeout overrides.",
+        failed_member="failed to verify print_timeout override permissions.",
+        denied="changing print_timeout overrides is restricted to group admins.",
+    ):
         return
 
     # ── clear ────────────────────────────────────────────────────────────
