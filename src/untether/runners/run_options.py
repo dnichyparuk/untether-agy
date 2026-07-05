@@ -22,6 +22,9 @@ class EngineRunOptions:
     # means "follow global ``[loop] enabled``"; True/False is an explicit
     # per-chat override set via ``/config → 🔁 Loop mode``.
     loop_enabled: bool | None = None
+    # Per-run override for the antigravity runner's `--print-timeout` flag.
+    # ``None`` falls through to the runner's own default (global config value).
+    print_timeout: str | None = None
 
 
 # Canonical per-engine permission_mode value sets. Used by trigger config

@@ -6195,3 +6195,181 @@ async def test_4b_stall_suppression_count_bumped_on_post_result() -> None:
         tg.start_soon(drive)
 
     assert stream.stall_suppression_counts.get("post_result", 0) >= 1
+
+
+class TestApplyProjectPrintTimeout:
+    """Task 3: ``_apply_project_print_timeout`` layers a project-level
+    antigravity ``print_timeout`` onto run_options, without clobbering an
+    explicit caller override or unrelated fields."""
+
+    @staticmethod
+    def _make_runtime(project):
+        class _FakeRuntime:
+            def project_for_alias(self, alias):
+                return project
+
+        return _FakeRuntime()
+
+    def test_antigravity_project_print_timeout_applied(self) -> None:
+        from pathlib import Path
+
+        from untether.config import ProjectConfig
+        from untether.context import RunContext
+        from untether.telegram.commands.executor import (
+            _apply_project_print_timeout,
+        )
+
+        project = ProjectConfig(
+            alias="myproj",
+            path=Path("/tmp/myproj"),
+            worktrees_dir=Path(".worktrees"),
+            print_timeout="20m",
+        )
+        context = RunContext(project="myproj")
+        runtime = self._make_runtime(project)
+
+        result = _apply_project_print_timeout(
+            None, context, runtime, engine="antigravity"
+        )
+
+        assert result is not None
+        assert result.print_timeout == "20m"
+
+    def test_non_antigravity_engine_leaves_run_options_unchanged(self) -> None:
+        from pathlib import Path
+
+        from untether.config import ProjectConfig
+        from untether.context import RunContext
+        from untether.runners.run_options import EngineRunOptions
+        from untether.telegram.commands.executor import (
+            _apply_project_print_timeout,
+        )
+
+        project = ProjectConfig(
+            alias="myproj",
+            path=Path("/tmp/myproj"),
+            worktrees_dir=Path(".worktrees"),
+            print_timeout="20m",
+        )
+        context = RunContext(project="myproj")
+        runtime = self._make_runtime(project)
+        run_options = EngineRunOptions(model="x")
+
+        result = _apply_project_print_timeout(
+            run_options, context, runtime, engine="claude"
+        )
+
+        assert result is run_options
+
+    def test_project_without_print_timeout_leaves_run_options_unchanged(
+        self,
+    ) -> None:
+        from pathlib import Path
+
+        from untether.config import ProjectConfig
+        from untether.context import RunContext
+        from untether.telegram.commands.executor import (
+            _apply_project_print_timeout,
+        )
+
+        project = ProjectConfig(
+            alias="myproj",
+            path=Path("/tmp/myproj"),
+            worktrees_dir=Path(".worktrees"),
+            print_timeout=None,
+        )
+        context = RunContext(project="myproj")
+        runtime = self._make_runtime(project)
+
+        result = _apply_project_print_timeout(
+            None, context, runtime, engine="antigravity"
+        )
+
+        assert result is None
+
+    def test_preset_run_option_print_timeout_not_overwritten(self) -> None:
+        from pathlib import Path
+
+        from untether.config import ProjectConfig
+        from untether.context import RunContext
+        from untether.runners.run_options import EngineRunOptions
+        from untether.telegram.commands.executor import (
+            _apply_project_print_timeout,
+        )
+
+        project = ProjectConfig(
+            alias="myproj",
+            path=Path("/tmp/myproj"),
+            worktrees_dir=Path(".worktrees"),
+            print_timeout="20m",
+        )
+        context = RunContext(project="myproj")
+        runtime = self._make_runtime(project)
+        run_options = EngineRunOptions(print_timeout="5m")
+
+        result = _apply_project_print_timeout(
+            run_options, context, runtime, engine="antigravity"
+        )
+
+        assert result is run_options
+        assert result.print_timeout == "5m"
+
+    def test_coexistence_preserves_other_fields(self) -> None:
+        from pathlib import Path
+
+        from untether.config import ProjectConfig
+        from untether.context import RunContext
+        from untether.runners.run_options import EngineRunOptions
+        from untether.telegram.commands.executor import (
+            _apply_project_print_timeout,
+        )
+
+        project = ProjectConfig(
+            alias="myproj",
+            path=Path("/tmp/myproj"),
+            worktrees_dir=Path(".worktrees"),
+            print_timeout="20m",
+        )
+        context = RunContext(project="myproj")
+        runtime = self._make_runtime(project)
+        run_options = EngineRunOptions(model="x")
+
+        result = _apply_project_print_timeout(
+            run_options, context, runtime, engine="antigravity"
+        )
+
+        assert result is not None
+        assert result.model == "x"
+        assert result.print_timeout == "20m"
+
+    def test_none_context_leaves_run_options_unchanged(self) -> None:
+        from untether.runners.run_options import EngineRunOptions
+        from untether.telegram.commands.executor import (
+            _apply_project_print_timeout,
+        )
+
+        runtime = self._make_runtime(project=None)
+        run_options = EngineRunOptions(model="x")
+
+        result = _apply_project_print_timeout(
+            run_options, None, runtime, engine="antigravity"
+        )
+
+        assert result is run_options
+
+    def test_unresolved_alias_leaves_run_options_unchanged(self) -> None:
+        from untether.context import RunContext
+        from untether.runners.run_options import EngineRunOptions
+        from untether.telegram.commands.executor import (
+            _apply_project_print_timeout,
+        )
+
+        context = RunContext(project="unknown-alias")
+        runtime = self._make_runtime(project=None)
+        run_options = EngineRunOptions(model="x")
+
+        result = _apply_project_print_timeout(
+            run_options, context, runtime, engine="antigravity"
+        )
+
+        assert result is run_options

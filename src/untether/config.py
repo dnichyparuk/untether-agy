@@ -77,6 +77,7 @@ class ProjectConfig:
     worktrees_dir: Path
     default_engine: str | None = None
     worktree_base: str | None = None
+    print_timeout: str | None = None
     chat_id: int | None = None
 
     @property

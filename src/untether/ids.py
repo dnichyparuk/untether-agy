@@ -20,6 +20,7 @@ RESERVED_CHAT_COMMANDS = frozenset(
         "ctx",
         "clone",
         "project",
+        "printtimeout",
     }
 )
 RESERVED_ENGINE_IDS = (
