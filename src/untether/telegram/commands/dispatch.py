@@ -18,11 +18,20 @@ from ...utils.error_display import user_safe_error
 from ..files import split_command_args
 from ..types import TelegramCallbackQuery, TelegramIncomingMessage
 from .executor import _TelegramCommandExecutor
+from .overrides import check_admin_or_private
 
 if TYPE_CHECKING:
     from ..bridge import TelegramBridgeConfig
 
 logger = get_logger(__name__)
+
+# CommandBackend commands that mutate per-chat or global state and therefore
+# require the same admin-or-private gate as the inline builtin commands
+# (/model, /reasoning, /listen, /printtimeout). CommandContext is
+# transport-agnostic (no cfg/msg), so this gate runs here at the dispatch
+# chokepoint, where the Telegram-specific cfg/msg are available, rather than
+# inside each backend's handle().
+_ADMIN_GATED_COMMAND_IDS = frozenset({"planmode", "verbose"})
 
 
 def _parse_callback_data(data: str) -> tuple[str, str]:
@@ -128,6 +137,20 @@ async def _dispatch_command(
         trigger_manager=cfg.trigger_manager,
         default_chat_id=cfg.chat_id,
     )
+    if command_id in _ADMIN_GATED_COMMAND_IDS:
+        decision = await check_admin_or_private(
+            cfg,
+            msg,
+            missing_sender=f"cannot verify sender for /{command_id}.",
+            failed_member=f"failed to verify /{command_id} permissions.",
+            denied=f"changing /{command_id} settings is restricted to group admins.",
+        )
+        if not decision.allowed:
+            if decision.error_text is not None:
+                await executor.send(
+                    decision.error_text, reply_to=message_ref, notify=True
+                )
+            return
     try:
         result = await backend.handle(ctx)
     except Exception as exc:
