@@ -1,5 +1,12 @@
 # changelog
 
+## v0.37.1 (2026-07-05)
+
+### fixes
+
+- **fix:** `/clone`, `/project`, `/planmode`, and `/verbose` mutated shared or global state with no permission gate, unlike `/model`/`/reasoning`/`/listen`/`/printtimeout` which all restrict their mutations to group admins (or any sender in a private chat). `/clone` and `/project` write global `[projects.<alias>]` config and (for `/clone`) run an arbitrary `git clone`; `/planmode` controls Claude Code's tool-execution permission mode. Any allowlisted group member — not just an admin — could previously trigger these. Added the same `require_admin_or_private` gate `/model`/`/reasoning`/`/printtimeout` already use to `handle_clone_command` (`src/untether/telegram/clone.py`) and `handle_project_command` (`src/untether/telegram/new_project.py`). `/planmode` and `/verbose` are `CommandBackend` plugins whose `handle(ctx)` has no access to the Telegram-specific `cfg`/`msg` the gate needs, so their check lives at the shared dispatch chokepoint instead — a new `_ADMIN_GATED_COMMAND_IDS` set in `src/untether/telegram/commands/dispatch.py`'s `_dispatch_command`, checked before `backend.handle(ctx)` runs. Found via a cross-command consistency review dimension after `/printtimeout` (v0.37.0) was found and fixed for the same gap. Added `tests/test_command_admin_gate.py` and denial-path tests in `tests/test_clone_command.py`/`tests/test_project_command.py` [#9](https://github.com/dnichyparuk/untether-agy/pull/9)
+  - Known follow-up (not covered by this fix): `/planmode`'s `/config` menu-button flow invokes the same `PlanModeCommand.handle()` through different plumbing that bypasses the new dispatch-level gate — only the text-command path (`/planmode ...`) is covered here.
+- **fix:** the thin `build_bot_commands` re-export in `src/untether/telegram/bridge.py` didn't forward the `include_clone`/`include_new_project` keyword arguments its `menu.py` target already accepts, so `bridge.build_bot_commands(runtime, include_clone=True)` raised `TypeError`. Production was unaffected (the startup path `_set_command_menu` calls the `menu.py` function directly), but the stale re-export broke `test_build_bot_commands_includes_clone_when_enabled`. Forwarded both kwargs through the re-export [#9](https://github.com/dnichyparuk/untether-agy/pull/9)
 ## v0.37.0 (2026-07-05)
 
 ### changes

@@ -34,6 +34,7 @@ from ..config import ConfigError
 from ..context import RunContext
 from ..logging import get_logger
 from . import clone
+from .commands.overrides import require_admin_or_private
 from .commands.reply import make_reply
 from .topic_state import TopicStateStore
 from .types import TelegramIncomingMessage
@@ -116,6 +117,18 @@ async def handle_project_command(
     np_cfg = cfg.new_project
     if not np_cfg.enabled:
         await reply(text="/project is disabled in this deployment.")
+        return
+
+    # /project creates a directory and writes global project config — gate
+    # it the same way /model/reasoning/printtimeout/clone gate their config
+    # mutations.
+    if not await require_admin_or_private(
+        cfg,
+        msg,
+        missing_sender="cannot verify sender for /project.",
+        failed_member="failed to verify /project permissions.",
+        denied="/project is restricted to group admins.",
+    ):
         return
 
     name = args_text.strip()

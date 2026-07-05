@@ -43,6 +43,7 @@ from ..settings import validate_settings_data
 from ..transport import RenderedMessage, SendOptions
 from ..transport_runtime import TransportRuntime
 from ..utils.env_policy import filtered_env
+from .commands.overrides import require_admin_or_private
 from .commands.reply import make_reply
 from .render import prepare_telegram
 from .topic_state import TopicStateStore
@@ -485,6 +486,18 @@ async def handle_clone_command(
 
     if not clone_cfg.enabled:
         await reply(text="/clone is disabled in this deployment.")
+        return
+
+    # /clone clones an arbitrary repo and writes global project config —
+    # gate it the same way /model/reasoning/printtimeout gate their (far
+    # less consequential) config mutations.
+    if not await require_admin_or_private(
+        cfg,
+        msg,
+        missing_sender="cannot verify sender for /clone.",
+        failed_member="failed to verify /clone permissions.",
+        denied="/clone is restricted to group admins.",
+    ):
         return
 
     url, dir_override, branch, parse_error = _parse_clone_args(args_text)

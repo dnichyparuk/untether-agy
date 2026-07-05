@@ -1194,6 +1194,32 @@ class TestHandleCloneCommand:
         last = transport.send_calls[-1]["message"].text
         assert "no config path available" in last
 
+    async def test_non_admin_denied_and_writes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg, transport, bot, config_path = _orch_cfg(
+            tmp_path, monkeypatch, topics_enabled=False, topic_result=None
+        )
+
+        async def _non_admin_member(chat_id: int, user_id: int):
+            _ = chat_id, user_id
+            from untether.telegram.api_schemas import ChatMember
+
+            return ChatMember(status="member")
+
+        monkeypatch.setattr(bot, "get_chat_member", _non_admin_member)
+        msg = _clone_msg("/clone https://github.com/owner/myrepo")
+
+        await handle_clone_command(
+            cfg, msg, args_text="https://github.com/owner/myrepo", topic_store=None
+        )
+
+        assert "restricted to group admins" in transport.send_calls[-1][
+            "message"
+        ].text
+        raw = read_config(config_path)
+        assert "myrepo" not in raw.get("projects", {})
+
     async def test_handle_clone_command_dir_override_escape_replies_error(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

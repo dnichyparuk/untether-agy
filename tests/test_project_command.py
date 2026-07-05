@@ -343,6 +343,30 @@ class TestHandleProjectCommand:
         assert "disabled" in transport.send_calls[-1]["message"].text
         assert "foo" not in read_config(config_path).get("projects", {})
 
+    async def test_non_admin_denied_and_writes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg, transport, bot, config_path = _orch_cfg(
+            tmp_path, monkeypatch, topics_enabled=False, topic_result=None
+        )
+
+        async def _non_admin_member(chat_id: int, user_id: int):
+            _ = chat_id, user_id
+            from untether.telegram.api_schemas import ChatMember
+
+            return ChatMember(status="member")
+
+        monkeypatch.setattr(bot, "get_chat_member", _non_admin_member)
+
+        await handle_project_command(
+            cfg, _project_msg("/project foo"), args_text="foo", topic_store=None
+        )
+
+        assert "restricted to group admins" in transport.send_calls[-1][
+            "message"
+        ].text
+        assert "foo" not in read_config(config_path).get("projects", {})
+
     async def test_empty_name_replies_usage(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
