@@ -74,9 +74,17 @@ via `extra_args` could silently contradict the configured permission stance.
   "working…" then the final answer. A long healthy run is stdout-silent; tune the `[watchdog]`
   expectations for this engine accordingly.
 - **agy's own print-timeout** — agy kills a headless run at its built-in `5m0s` by default.
-  Untether raises this to `15m` (`--print-timeout 15m`) so long tasks aren't cut off mid-run;
-  Untether's stall/liveness watchdogs are inert for a stdout-silent agy run, so this is the
-  only timeout that governs it. Tune via `[antigravity] print_timeout` (Go duration syntax).
+  Untether raises this to `15m` (`--print-timeout 15m`) so long tasks aren't cut off mid-run.
+  Untether's stdout-gated liveness watchdog is inert for a stdout-silent agy run, but the
+  bridge's event-silence stall monitor (`runner_bridge.py:_stall_monitor`) is **not** —
+  since agy emits no interim `ActionEvent`s, the monitor uses a dedicated 15-minute
+  "no progress" threshold for this engine (matching the default `print_timeout`) instead of
+  the standard 5-minute one, so a healthy run completes before a stall warning fires. Raising
+  `[antigravity] print_timeout` (or a project's `print_timeout` override) beyond 15 minutes
+  will still surface a stall warning before agy's own timeout — there is currently no separate
+  knob to raise the stall threshold to match. Setting `print_timeout = ""` restores agy's
+  built-in `5m0s` (the flag is simply omitted).
+  Tune via `[antigravity] print_timeout` (Go duration syntax).
 - **No USD cost / budgets** — tokens only.
 - **Model footer may misreport** — the envelope has no `model` field and `agy` silently ignores
   an invalid `--model`; the footer reflects the *configured* model.

@@ -278,6 +278,16 @@ def test_build_runner_rejects_permission_flags(tmp_path: Path) -> None:
             build_runner({"extra_args": [flag]}, tmp_path / "untether.toml")
 
 
+def test_build_runner_rejects_duplicate_print_timeout_flag(tmp_path: Path) -> None:
+    # --print-timeout is backed by the dedicated print_timeout config key;
+    # allowing it via extra_args would append a second flag and silently
+    # defeat the configured default.
+    with pytest.raises(ConfigError):
+        build_runner(
+            {"extra_args": ["--print-timeout", "5m"]}, tmp_path / "untether.toml"
+        )
+
+
 def test_build_runner_rejects_bad_model(tmp_path: Path) -> None:
     with pytest.raises(ConfigError):
         build_runner({"model": 123}, tmp_path / "untether.toml")
