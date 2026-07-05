@@ -10,7 +10,7 @@ description: "Common questions about Untether: installation, supported engines, 
 
 ## What is Untether?
 
-Untether is a Telegram bridge for AI coding agents. It runs on your computer (or a server you control) and forwards messages between Telegram and the agent CLI of your choice — Claude Code, Codex, OpenCode, Pi, Gemini CLI, or Amp.
+Untether is a Telegram bridge for AI coding agents. It runs on your computer (or a server you control) and forwards messages between Telegram and the agent CLI of your choice — Claude Code, Codex, OpenCode, Pi, Gemini CLI, Amp, or Antigravity (`agy`).
 
 Your machine still does all the work. Untether is the wire between your phone and the agent, with progress streaming, interactive approval buttons, voice transcription, cost tracking, scheduled runs, and inline settings layered on top. The intent is simple: keep using the same agent you already use, but stop being chained to a terminal window when you want to walk the dog or watch the footy.
 
@@ -34,9 +34,34 @@ The first run launches a setup wizard that creates a Telegram bot via [BotFather
 
 Already have a bot token? Skip the BotFather step with `untether --bot-token YOUR_TOKEN`. Full walkthrough: [Install and onboard](https://untether.littlebearapps.com/tutorials/install/).
 
+## How do I add a new project or repo to Untether?
+
+Three ways. If you already have the repo cloned on the machine Untether runs on, register it from a terminal:
+
+```sh
+cd ~/dev/happy-gadgets
+untether init happy-gadgets
+```
+
+If the repo isn't on the machine yet, send `/clone` from Telegram instead — no terminal needed:
+
+```
+/clone https://github.com/happy-org/happy-gadgets
+```
+
+`/clone` accepts `https://github.com/OWNER/REPO[.git]` and scp-style `git@github.com:OWNER/REPO[.git]` URLs, runs a native `git clone` using your host's existing git credentials, derives a project alias from the repo name, and writes the same `[projects.<alias>]` config entry `untether init` would. In a forum-enabled group chat it goes one step further and creates a topic bound to the new project, so you can start chatting in it immediately. Only hosts listed in `[clone] allowed_hosts` (default just `github.com`) are accepted, and the clone destination is confined to the configured `[clone] root` directory. Full walkthrough: [Projects — bootstrap a repo with /clone](https://github.com/littlebearapps/untether/blob/master/docs/how-to/projects.md#bootstrap-a-repo-from-telegram-with-clone).
+
+If you're starting a brand-new project with no repo at all, send `/project` instead:
+
+```
+/project happy-gadgets
+```
+
+`/project` sanitizes the name into an alias, creates an empty directory under the configured `[new_project] root`, and writes the same `[projects.<alias>]` config entry `untether init` would. Unlike `/clone` it doesn't dedupe the alias — if one already exists it refuses and tells you the existing path. In a forum-enabled group chat it also creates a topic bound to the new project.
+
 ## Which AI coding agents does Untether support?
 
-Untether supports six agent CLIs out of the box:
+Untether supports seven agent CLIs out of the box:
 
 - **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** — complex refactors, architecture, long context. Most interactive features (plan mode, ask mode, diff preview, progressive cooldown) are Claude-specific.
 - **[Codex](https://github.com/openai/codex)** — fast edits, shell commands, OpenAI subscription via ChatGPT login.
@@ -44,6 +69,7 @@ Untether supports six agent CLIs out of the box:
 - **[Pi](https://github.com/mariozechner/pi-coding-agent)** — multi-provider auth, conversational style.
 - **[Gemini CLI](https://github.com/google-gemini/gemini-cli)** — Google Gemini models with configurable approval modes.
 - **[Amp](https://ampcode.com)** — Sourcegraph's coding agent with mode selection.
+- **[Antigravity](https://antigravity.google)** — Google's agent CLI (`agy`); non-interactive structured-result runs (no live progress or interactive approval), authenticates via the OS keyring.
 
 You can switch between engines per-message by prefixing with `/<engine>` (e.g. `/claude`, `/codex`). Each chat or topic can also have its own default engine. The full per-engine feature matrix is in the [README](https://github.com/littlebearapps/untether#-supported-engines).
 

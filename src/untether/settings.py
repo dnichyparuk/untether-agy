@@ -375,6 +375,60 @@ class WatchdogSettings(BaseModel):
         return self
 
 
+class CloneSettings(BaseModel):
+    """`/clone` command settings (Task 2 of the clone-command feature).
+
+    ``root`` is the default parent directory new clones land under when the
+    ``--dir`` override is not supplied; ``allowed_hosts`` gates which Git
+    hosts ``parse_repo_url``/``host_is_allowed`` (see
+    ``telegram/clone.py``) will accept for both the https and scp-style
+    (``git@host:owner/repo``) URL forms.
+
+    ``default_engine`` seeds the ``default_engine`` field written into the new
+    ``[projects.<alias>]`` block at clone time. It defaults to ``None``, which
+    means "don't pin an engine" — the cloned project (and its bound topic)
+    then inherits the currently configured global ``default_engine`` via the
+    normal resolution chain (see ``telegram/engine_defaults.py``). Set it
+    explicitly here only to force every clone onto a specific engine
+    regardless of the global default.
+    """
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    enabled: bool = True
+    root: NonEmptyStr = "~/untether-projects"
+    allowed_hosts: list[NonEmptyStr] = Field(default_factory=lambda: ["github.com"])
+    default_engine: NonEmptyStr | None = None
+    depth: int = Field(default=1, ge=1)
+
+
+class NewProjectSettings(BaseModel):
+    """`/project` command settings — register a new local project (no git clone).
+
+    ``enabled`` gates the command entirely: when ``False``, ``/project`` replies
+    that it is disabled and is omitted from the Telegram command menu.
+
+    ``root`` is the parent directory the new (empty) project directory is
+    created under — ``<root>/<alias>`` — mirroring ``[clone] root``. Unlike
+    ``/clone`` there is no ``--dir`` override in v1, so every new project lands
+    directly under ``root``.
+
+    ``default_engine`` seeds the ``default_engine`` field written into the new
+    ``[projects.<alias>]`` block at registration time. It defaults to ``None``,
+    which means "don't pin an engine" — the new project (and its bound topic)
+    then inherits the currently configured global ``default_engine`` via the
+    normal resolution chain (see ``telegram/engine_defaults.py``). Set it
+    explicitly here only to force every ``/project`` registration onto a
+    specific engine regardless of the global default.
+    """
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    enabled: bool = True
+    root: NonEmptyStr = "~/untether-projects"
+    default_engine: NonEmptyStr | None = None
+
+
 class ProgressSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -470,6 +524,8 @@ class UntetherSettings(BaseSettings):
     watchdog: WatchdogSettings = Field(default_factory=WatchdogSettings)
     auto_continue: AutoContinueSettings = Field(default_factory=AutoContinueSettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
+    clone: CloneSettings = Field(default_factory=CloneSettings)
+    new_project: NewProjectSettings = Field(default_factory=NewProjectSettings)
 
     @model_validator(mode="before")
     @classmethod

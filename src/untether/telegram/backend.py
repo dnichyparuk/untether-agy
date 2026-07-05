@@ -13,6 +13,8 @@ from ..logging import get_logger
 from ..markdown import MarkdownFormatter
 from ..runner_bridge import ExecBridgeConfig
 from ..settings import (
+    CloneSettings,
+    NewProjectSettings,
     ProgressSettings,
     TelegramTopicsSettings,
     TelegramTransportSettings,
@@ -45,6 +47,56 @@ def _load_progress_settings() -> ProgressSettings:
     except Exception:  # noqa: BLE001
         logger.debug("progress_settings.load_failed", exc_info=True)
         return ProgressSettings()
+
+
+def _load_clone_settings() -> CloneSettings:
+    """Load `[clone]` settings from config, returning defaults if unavailable.
+
+    ``[clone]`` lives on the top-level :class:`UntetherSettings`, not on the
+    per-transport ``[transports.telegram]`` block, so it isn't available on
+    the ``TelegramTransportSettings`` passed into ``build_and_run``. Mirror
+    :func:`_load_progress_settings` to read it from the full settings.
+    """
+    try:
+        from ..settings import load_settings_if_exists
+
+        result = load_settings_if_exists()
+        if result is None:
+            return CloneSettings()
+        settings, _ = result
+        return settings.clone
+    except Exception:  # noqa: BLE001 — intentionally broad: this is a
+        # best-effort startup read of an optional config section (missing
+        # file, malformed TOML, permission error, or a schema violation
+        # elsewhere in the file should all fall back to defaults rather
+        # than abort startup); mirrors `_load_progress_settings` above.
+        logger.debug("clone_settings.load_failed", exc_info=True)
+        return CloneSettings()
+
+
+def _load_new_project_settings() -> NewProjectSettings:
+    """Load `[new_project]` settings from config, returning defaults if unavailable.
+
+    ``[new_project]`` lives on the top-level :class:`UntetherSettings`, not on
+    the per-transport ``[transports.telegram]`` block, so it isn't available
+    on the ``TelegramTransportSettings`` passed into ``build_and_run``. Mirror
+    :func:`_load_clone_settings` to read it from the full settings.
+    """
+    try:
+        from ..settings import load_settings_if_exists
+
+        result = load_settings_if_exists()
+        if result is None:
+            return NewProjectSettings()
+        settings, _ = result
+        return settings.new_project
+    except Exception:  # noqa: BLE001 — intentionally broad: this is a
+        # best-effort startup read of an optional config section (missing
+        # file, malformed TOML, permission error, or a schema violation
+        # elsewhere in the file should all fall back to defaults rather
+        # than abort startup); mirrors `_load_clone_settings` above.
+        logger.debug("new_project_settings.load_failed", exc_info=True)
+        return NewProjectSettings()
 
 
 def _expect_transport_settings(transport_config: object) -> TelegramTransportSettings:
@@ -289,6 +341,8 @@ class TelegramBackend(TransportBackend):
             allow_any_user=settings.allow_any_user,
             topics=settings.topics,
             files=settings.files,
+            clone=_load_clone_settings(),
+            new_project=_load_new_project_settings(),
             trigger_config=trigger_config,
         )
 

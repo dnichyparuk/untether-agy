@@ -183,6 +183,25 @@ def test_build_bot_commands_includes_topics_when_enabled() -> None:
     assert {"command": "ctx", "description": "show or update context"} in commands
 
 
+def test_build_bot_commands_includes_clone_when_enabled() -> None:
+    runner = ScriptRunner(
+        [Return(answer="ok")], engine=CODEX_ENGINE, resume_value="sid"
+    )
+    runtime = TransportRuntime(
+        router=_make_router(runner),
+        projects=_empty_projects(),
+    )
+
+    with_clone = build_bot_commands(runtime, include_clone=True)
+    assert {
+        "command": "clone",
+        "description": "clone a git repo & register it",
+    } in with_clone
+
+    without_clone = build_bot_commands(runtime, include_clone=False)
+    assert not any(cmd["command"] == "clone" for cmd in without_clone)
+
+
 def test_build_bot_commands_includes_command_plugins(monkeypatch) -> None:
     class _Command:
         id = "pingcmd"

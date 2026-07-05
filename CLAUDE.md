@@ -1,6 +1,6 @@
 # Untether
 
-Telegram bridge for Claude Code, Codex, OpenCode, Pi, Gemini CLI, Amp, and other agent CLIs. Control your coding agents from anywhere — walking the dog, watching footy, at a friend's place.
+Telegram bridge for Claude Code, Codex, OpenCode, Pi, Gemini CLI, Amp, Antigravity (`agy`), and other agent CLIs. Control your coding agents from anywhere — walking the dog, watching footy, at a friend's place.
 
 **Repo**: [littlebearapps/untether](https://github.com/littlebearapps/untether)
 **Based on**: [banteg/takopi](https://github.com/banteg/takopi) (upstream)
@@ -39,7 +39,7 @@ Untether adds interactive permission control, plan mode support, and several UX 
 - **Agent-initiated file delivery (outbox)** — agents write files to `.untether-outbox/` during a run; Untether sends them as Telegram documents on completion with `📎` captions; deny-glob security, size limits, file count cap, auto-cleanup; `[transports.telegram.files]` config
 - **Progress persistence** — active progress messages persisted to `active_progress.json`; on restart, orphan messages edited to "⚠️ interrupted by restart" with keyboard removed
 - **Resume line formatting** — visual separation with blank line and ↩️ prefix in final message footer
-- **`/continue`** — cross-environment resume; pick up the most recent CLI session from Telegram using each engine's native continue flag (`--continue`, `resume --last`, `--resume latest`); supported for Claude, Codex, OpenCode, Pi, Gemini (not AMP)
+- **`/continue`** — cross-environment resume; pick up the most recent CLI session from Telegram using each engine's native continue flag (`--continue`, `resume --last`, `--resume latest`); supported for Claude, Codex, OpenCode, Pi, Gemini, and Antigravity (`agy`, machine-global `--continue`) (not AMP)
 - **Timezone-aware cron triggers** — per-cron `timezone` or global `default_timezone` with IANA names (e.g. `Australia/Melbourne`); DST-aware via `zoneinfo`; invalid names rejected at config parse time
 - **Hot-reload trigger configuration** — editing `untether.toml` applies cron/webhook changes immediately without restart; `TriggerManager` holds mutable state that the cron scheduler and webhook server reference at runtime; `handle_reload()` re-parses `[triggers]` on config file change
 - **Hot-reload Telegram bridge settings** — `voice_transcription`, file transfer, `allowed_user_ids`, timing, and `show_resume_line` settings reload without restart; `TelegramBridgeConfig` unfrozen (slots kept) with `update_from()` wired into `handle_reload()`; restart-only keys (`bot_token`, `chat_id`, `session_mode`, `topics`, `message_overflow`) still warn
@@ -50,13 +50,15 @@ Untether adds interactive permission control, plan mode support, and several UX 
 - **`diff_preview` plan bypass (#283)** — after user approves a plan outline via "Pause & Outline Plan", the `_discuss_approved` flag short-circuits diff preview for subsequent Edit/Write tools so no second approval is needed
 - **User-extensible env allowlist (#409)** — `[security] env_extra_allow` and `env_extra_prefix_allow` (in `untether.toml`) extend the engine-subprocess env allowlist with per-deployment names so users can thread credential-manager tokens (1Password, Doppler, Vault, Infisical, …) without forking `utils/env_policy.py`. Names are validated against `[A-Z_][A-Z0-9_]*`. Honoured by the Claude and Pi runners and by the `env_audit` probe. `BWS_ACCESS_TOKEN` was promoted into the built-in defaults at the same time. One `env_policy.user_extension` INFO log per process
 - **Master trigger pause toggle (#294)** — `TriggerManager.pause()` / `resume()` / `is_paused` gate cron firing and webhook dispatch globally; webhook server returns `503 triggers paused` (with `Retry-After: 60`); `/health` endpoint reflects paused state. Wired into `/config` two ways: home-page button row (only when triggers configured) and a dedicated `📡 Triggers` page (`config:tg`) showing counts + Pause/Resume button. `/ping` switches to `⏸ triggers paused: … (suspended)` while paused. Pause is in-memory only — restart auto-resumes (safe default)
+- **`/clone`** — clone a Git repo and register it as a project directly from Telegram (no terminal needed): `/clone https://github.com/owner/repo` (also accepts scp-style `git@host:owner/repo` URLs and an optional `--dir`/branch override). Runs a native `git clone` with the host's existing git credentials, derives a deduped alias, and writes the same `[projects.<alias>]` config entry `untether init` would; in a forum-enabled group it also creates a bound topic. Host allowlist (`[clone] allowed_hosts`, default `github.com`) and destination confinement to `[clone] root` guard against SSRF/path-escape; degrades to a register-only reply if the topic step fails or is out of scope
+- **`/project`** — register a brand-new local project directly from Telegram without cloning any repo: `/project <name>`. Sanitizes the name to an alias, refuses if the alias already exists (no dedupe, unlike `/clone`), creates an empty destination directory under `[new_project] root`, and writes a `[projects.<alias>]` entry; in a forum-enabled group in scope it also creates and binds a topic (reusing the shared topic-creation helper extracted from `/clone`), degrading to register-only otherwise. New `[new_project]` config section (`enabled`, `root`, `default_engine`), hot-reloadable
 
 See `.claude/skills/claude-stream-json/` and `.claude/rules/control-channel.md` for implementation details.
 
 ## Architecture
 
 ```
-Telegram <-> TelegramPresenter <-> RunnerBridge <-> Runner (claude/codex/opencode/pi/gemini/amp)
+Telegram <-> TelegramPresenter <-> RunnerBridge <-> Runner (claude/codex/opencode/pi/gemini/amp/antigravity)
                                        |
                                   ProgressTracker
 ```
@@ -73,6 +75,7 @@ Telegram <-> TelegramPresenter <-> RunnerBridge <-> Runner (claude/codex/opencod
 | `runners/claude.py` | Claude Code runner, interactive features |
 | `runners/gemini.py` | Gemini CLI runner |
 | `runners/amp.py` | AMP CLI runner (Sourcegraph) |
+| `runners/antigravity.py` | Antigravity CLI (`agy`) runner — non-interactive, structured JSON result envelope (no live progress) |
 | `runner_bridge.py` | Connects runners to Telegram presenter, injects agent preamble, auto-continue with signal death suppression |
 | `cost_tracker.py` | Per-run/daily cost tracking and budget alerts |
 | `commands/claude_control.py` | Approve/Deny/Discuss callback handler |
@@ -87,6 +90,8 @@ Telegram <-> TelegramPresenter <-> RunnerBridge <-> Runner (claude/codex/opencod
 | `commands/config.py` | `/config` inline settings menu |
 | `commands/ask_question.py` | AskUserQuestion option button handler |
 | `commands/topics.py` | `/new`, `/ctx`, `/topic` commands; `_cancel_chat_tasks()` helper |
+| `telegram/clone.py` | `/clone` command — URL parsing, `git clone` subprocess, project registration, optional topic creation |
+| `telegram/new_project.py` | `/project` command — alias sanitization, empty-dir creation, project registration, optional topic creation |
 | `commands/listen.py` | `/listen` command (listen-mode toggle); `/trigger` deprecated alias (#297) |
 | `listen_mode.py` | `resolve_listen_mode()` and `should_trigger_run()` for response gating |
 | `utils/proc_diag.py` | `/proc` process diagnostics for stall analysis (CPU, RSS, TCP, FDs, children) |
@@ -138,6 +143,9 @@ Detailed protocol specs and event cheatsheets for each integration:
 | AMP runner spec | `docs/reference/runners/amp/runner.md` | CLI invocation, stream-json, mode/model selection |
 | AMP stream-json | `docs/reference/runners/amp/stream-json-cheatsheet.md` | JSONL event shapes (`system`, `assistant`, `user`, `result`) |
 | AMP event mapping | `docs/reference/runners/amp/untether-events.md` | AMP JSONL → Untether event translation rules |
+| Antigravity runner spec | `docs/reference/runners/antigravity/runner.md` | CLI invocation, `--output-format json`, resume, capability tier |
+| Antigravity result envelope | `docs/reference/runners/antigravity/stream-json-cheatsheet.md` | Single JSON result envelope (`conversation_id`, `status`, `response`, `usage`) |
+| Antigravity event mapping | `docs/reference/runners/antigravity/untether-events.md` | Envelope → Untether Started/Completed translation rules |
 | Telegram transport | `docs/reference/transports/telegram.md` | Bot API client, outbox/rate-limiting, voice transcription, forum topics |
 | Workflow modes | `docs/reference/modes.md` | Assistant, workspace, handoff — settings, commands, mode-agnostic features |
 
@@ -231,6 +239,8 @@ Key test files:
 - `test_at_command.py` — 34 tests: `/at` parse (valid/invalid suffixes, bounds, case-insensitive), `_format_delay`, schedule/cancel, per-chat cap, scheduler install/uninstall
 - `test_offset_persistence.py` — 15 tests: Telegram update_id round-trip, corrupt JSON handling, atomic write, `DebouncedOffsetWriter` interval/max-pending semantics, explicit flush
 - `test_sdnotify.py` — 7 tests: NOTIFY_SOCKET handling (absent/empty/filesystem/abstract-namespace), send error swallowing, UTF-8 encoding
+- `test_clone_command.py` — 95 tests: `/clone` URL parsing (https/scp, host allowlist, unsafe segments), alias derivation + dedup, destination confinement, `git clone` subprocess outcomes, project registration, dispatcher concurrency guard, hot-reload, command-menu inclusion
+- `test_project_command.py` — 48 tests: `NewProjectSettings` validation/defaults, `sanitize_alias`/`derive_alias` edge cases, `resolve_project_path` traversal/symlink confinement, `handle_project_command` orchestration (disabled, invalid name, alias-collision refusal, non-empty-dest refusal, register-only + topic-bound paths, degrade-to-register-only, write failures), dispatcher concurrency guards, `[new_project]` hot-reload, command-menu inclusion
 
 ## Development
 

@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  Works with <a href="https://docs.anthropic.com/en/docs/claude-code">Claude Code</a> · <a href="https://github.com/openai/codex">Codex</a> · <a href="https://github.com/opencode-ai/opencode">OpenCode</a> · <a href="https://github.com/nicholasgasior/pi">Pi</a> · <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> · <a href="https://ampcode.com">Amp</a>
+  Works with <a href="https://docs.anthropic.com/en/docs/claude-code">Claude Code</a> · <a href="https://github.com/openai/codex">Codex</a> · <a href="https://github.com/opencode-ai/opencode">OpenCode</a> · <a href="https://github.com/nicholasgasior/pi">Pi</a> · <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> · <a href="https://ampcode.com">Amp</a> · <a href="https://antigravity.google">Antigravity</a>
 </p>
 
 <p align="center">
@@ -22,6 +22,10 @@
 <p align="center">
   <a href="#-quick-start">Quick Start</a> · <a href="#-features">Features</a> · <a href="#-supported-engines">Engines</a> · <a href="#-help-guides">Guides</a> · <a href="#-commands">Commands</a> · <a href="#-contributing">Contributing</a>
 </p>
+
+---
+
+> **Fork note:** This is a fork of the original [littlebearapps/untether](https://github.com/littlebearapps/untether) that **adds support for Google's [Antigravity](https://antigravity.google) CLI (`agy`)** as a coding-agent engine, alongside the engines the upstream project already supports. See the [Antigravity runner reference](docs/reference/runners/antigravity/runner.md) and [configuration](docs/reference/config.md#antigravity) for details. All other functionality tracks upstream.
 
 ---
 
@@ -90,11 +94,13 @@ The wizard offers three **workflow modes** — pick the one that fits:
 - 🔐 **Interactive permissions** — approve plan transitions and answer clarifying questions with inline option buttons; tools auto-execute, with progressive cooldown after "Pause & Outline Plan"
 - 📋 **Plan mode** — toggle per chat with `/planmode`; choose full manual approval, auto-approved transitions, or no plan phase
 - 📁 **Projects and worktrees** — register repos with `untether init`, target with `/myproject @feat/thing`, run branches in isolated worktrees in parallel
+- 🌱 **Clone from Telegram** — `/clone <repo-url> [--dir <path>] [@<branch>]` clones a GitHub repo with native git, auto-registers it as a project, and (in a forum-enabled group) creates a topic bound to it — no terminal round-trip needed to onboard a new repo
+- 🌱 **New project from Telegram** — `/project <name>` creates an empty local project directory, auto-registers it, and (in a forum-enabled group) creates a topic bound to it — for starting a brand-new project without cloning a repo
 - 💰 **Cost and usage tracking** — run agents remotely with confidence; per-run and daily budgets, `/usage` breakdowns, and optional auto-cancel keep spending visible
 - 💡 **Actionable error hints** — friendly messages for API outages, rate limits, billing errors, and network failures with resume guidance
 - 🏷 **Model and mode metadata** — every completed message shows model with version, effort level, and permission mode (e.g. `🏷 opus 4.6 · medium · plan`) across all engines
 - 🎙️ **Voice notes** — hands full? Dictate tasks instead of typing; Untether transcribes via a configurable Whisper-compatible endpoint
-- 🔄 **Cross-environment resume** — start a session in your terminal, pick it up from Telegram with `/continue`; works with Claude Code, Codex, OpenCode, Pi, and Gemini ([guide](docs/how-to/cross-environment-resume.md))
+- 🔄 **Cross-environment resume** — start a session in your terminal, pick it up from Telegram with `/continue`; works with Claude Code, Codex, OpenCode, Pi, Gemini, and Antigravity (`agy`) ([guide](docs/how-to/cross-environment-resume.md))
 - 📎 **File transfer** — upload files to your repo with `/file put`, download with `/file get`; agents can also deliver files automatically by writing to `.untether-outbox/` during a run — sent as Telegram documents on completion
 - 🛡️ **Graceful recovery** — orphan progress messages cleaned up on restart; stall detection with CPU-aware diagnostics; auto-continue for Claude Code sessions that exit prematurely
 - ⏰ **Scheduled tasks** — cron expressions with timezone support, webhook triggers, one-shot delays (`/at 30m <prompt>`), `run_once` crons, master pause/resume toggle, and hot-reload configuration (no restart required). `/ping` shows per-chat trigger summary; trigger-initiated runs show provenance in the footer (`⏰ cron:<id>` / `⚡ webhook:<id>` / `⏰ at:<token>`); `/stats` reports per-engine triggered-vs-manual breakdown
@@ -121,35 +127,36 @@ The wizard offers three **workflow modes** — pick the one that fits:
 | [Pi](https://github.com/mariozechner/pi-coding-agent) | `npm i -g @mariozechner/pi-coding-agent` | Multi-provider auth, conversational |
 | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | `npm i -g @google/gemini-cli` | Google Gemini models, configurable approval mode |
 | [Amp](https://ampcode.com) | `npm i -g @sourcegraph/amp` | Sourcegraph's AI coding agent, mode selection |
+| [Antigravity](https://antigravity.google) | `curl -fsSL https://antigravity.google/cli/install.sh \| bash` | Google's `agy` CLI; non-interactive structured-result runs, keyring/OAuth auth |
 
-**Note:** Use your existing Claude or ChatGPT subscription — no extra API keys needed (unless you want API billing).
+**Note:** Use your existing Claude or ChatGPT subscription — no extra API keys needed (unless you want API billing). Antigravity authenticates via the OS keyring (Google OAuth) — run `agy` once interactively on the host to sign in before headless use.
 
 ### Engine compatibility
 
-| Feature | Claude Code | Codex CLI | OpenCode | Pi | Gemini CLI | Amp |
-|---------|:-----------:|:---------:|:--------:|:--:|:----------:|:---:|
-| **Progress streaming** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Session resume** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Model override** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅¹ |
-| **Model in footer** | ✅ | ✅ | ✅ | — | ✅ | — |
-| **Approval mode in footer** | ✅ | ~⁴ | — | — | ~² | — |
-| **Voice input** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Verbose progress** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Error hints** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Preamble injection** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Cost tracking** | ✅ | ~³ | ✅ | ~³ | ~³ | ~³ |
-| **Interactive permissions** | ✅ | — | — | — | — | — |
-| **Approval policy** | ✅ | ~⁴ | — | — | ~² | — |
-| **Plan mode** | ✅ | — | — | — | — | — |
-| **Ask mode (option buttons)** | ✅ | — | — | — | — | — |
-| **Diff preview** | ✅ | — | — | — | — | — |
-| **Auto-approve safe tools** | ✅ | — | — | — | — | — |
-| **Progressive cooldown** | ✅ | — | — | — | — | — |
-| **Subscription usage** | ✅ | — | — | — | — | — |
-| **Reasoning/effort levels** | ✅ | ✅ | — | — | — | — |
-| **Device re-auth (`/auth`)** | — | ✅ | — | — | — | — |
-| **Context compaction** | — | — | — | ✅ | — | — |
-| **Cross-env resume (`/continue`)** | ✅ | ✅ | ✅ | ✅⁵ | ✅ | —⁶ |
+| Feature | Claude Code | Codex CLI | OpenCode | Pi | Gemini CLI | Amp | Antigravity |
+|---------|:-----------:|:---------:|:--------:|:--:|:----------:|:---:|:-----------:|
+| **Progress streaming** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | —⁷ |
+| **Session resume** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Model override** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅¹ | ✅ |
+| **Model in footer** | ✅ | ✅ | ✅ | — | ✅ | — | ✅⁸ |
+| **Approval mode in footer** | ✅ | ~⁴ | — | — | ~² | — | ✅ |
+| **Voice input** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Verbose progress** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | —⁷ |
+| **Error hints** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Preamble injection** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Cost tracking** | ✅ | ~³ | ✅ | ~³ | ~³ | ~³ | ~³ |
+| **Interactive permissions** | ✅ | — | — | — | — | — | — |
+| **Approval policy** | ✅ | ~⁴ | — | — | ~² | — | —⁹ |
+| **Plan mode** | ✅ | — | — | — | — | — | — |
+| **Ask mode (option buttons)** | ✅ | — | — | — | — | — | — |
+| **Diff preview** | ✅ | — | — | — | — | — | — |
+| **Auto-approve safe tools** | ✅ | — | — | — | — | — | — |
+| **Progressive cooldown** | ✅ | — | — | — | — | — | — |
+| **Subscription usage** | ✅ | — | — | — | — | — | — |
+| **Reasoning/effort levels** | ✅ | ✅ | — | — | — | — | —¹⁰ |
+| **Device re-auth (`/auth`)** | — | ✅ | — | — | — | — | — |
+| **Context compaction** | — | — | — | ✅ | — | — | — |
+| **Cross-env resume (`/continue`)** | ✅ | ✅ | ✅ | ✅⁵ | ✅ | —⁶ | ✅¹¹ |
 
 ¹ Amp model override maps to `--mode` (deep/free/rush/smart).
 ² Defaults to full access (`--approval-mode=yolo`, all tools auto-approved); toggle via `/config` to edit files (`auto_edit`, files OK but no shell) or read-only; pre-run policy, not interactive mid-run approval.
@@ -157,6 +164,11 @@ The wizard offers three **workflow modes** — pick the one that fits:
 ⁴ Toggle via `/config` between full auto (default) and safe (`--ask-for-approval=untrusted`, untrusted tools blocked); pre-run policy, not interactive mid-run approval.
 ⁵ Pi requires `provider = "openai-codex"` in engine config for OAuth subscriptions in headless mode.
 ⁶ AMP requires an explicit thread ID; no "most recent" mode.
+⁷ Antigravity returns a single result envelope at completion (no intermediate event stream), so the message shows "working…" then the final answer — no live or verbose progress.
+⁸ The result envelope has no model field and `agy` silently ignores an invalid `--model`, so the footer reflects the *configured* model.
+⁹ Permission stance (`auto_approve` / `sandbox`) is fixed at spawn time via config — `agy` has no interactive approval channel through Untether.
+¹⁰ The reasoning tier is baked into the model name (e.g. `Gemini 3.1 Pro (High)`); there is no separate effort flag.
+¹¹ `agy --continue` resumes the machine-most-recent conversation (machine-global, not per-project); per-session resume via the message footer is preferred.
 
 Claude effort levels: `low`, `medium`, `high`, `xhigh`, `max` (`xhigh` requires Claude Code v2.1.114+).
 
@@ -173,6 +185,8 @@ Claude effort levels: `low`, `medium`, `high`, `xhigh`, `max` (`xhigh` requires 
 | `/usage` | Show API costs for the current session (`/usage debug` shows fetch state, OAuth expiry, schema-mismatch counter) |
 | `/export` | Export session transcript |
 | `/browse` | Browse project files |
+| `/clone <repo-url> [--dir <path>] [@<branch>]` | Clone a GitHub repo and auto-register it as a project; in a forum-enabled group it also creates a topic bound to the new project ([guide](docs/how-to/projects.md#bootstrap-a-repo-from-telegram-with-clone)) |
+| `/project <name>` | Create an empty local project directory and auto-register it; in a forum-enabled group it also creates a topic bound to the new project ([guide](docs/how-to/projects.md#bootstrap-a-new-project-from-telegram-with-project)) |
 | `/new` | Cancel running tasks and clear stored sessions |
 | `/continue` | Resume the most recent CLI session in this project ([guide](docs/how-to/cross-environment-resume.md)) |
 | `/file put/get` | Transfer files |
@@ -210,6 +224,17 @@ session_mode = "chat"
 [projects.myapp]
 path = "~/dev/myapp"
 default_engine = "claude"
+
+# `/clone <repo-url>` — clone a GitHub repo from Telegram and auto-register it
+[clone]
+enabled = true
+root = "~/untether-projects"
+allowed_hosts = ["github.com"]
+
+# `/project <name>` — register a brand-new empty local project from Telegram
+[new_project]
+enabled = true
+root = "~/untether-projects"
 
 [cost_budget]
 enabled = true
