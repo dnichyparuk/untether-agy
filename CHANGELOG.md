@@ -1,5 +1,11 @@
 # changelog
 
+## v0.37.0 (2026-07-05)
+
+### changes
+
+- **feat:** new `/printtimeout` command — set, show, or clear a per-project override of the Antigravity (`agy`) `--print-timeout` directly from Telegram. Grammar: `/printtimeout` (show effective value + global default), `/printtimeout 30m` / `/printtimeout 1h30m` (set, Go duration syntax, lenient client-side validation), `/printtimeout clear` (revert to global default). New `print_timeout` field on `ProjectSettings`/`ProjectConfig` (`src/untether/settings.py`, `src/untether/config.py`); resolved per-run into the existing `EngineRunOptions` ContextVar (the same channel `model` uses) via a new `AntigravityRunner._resolved_print_timeout()` (`src/untether/runners/run_options.py`, `src/untether/runners/antigravity.py`); injected in the executor's `_run_engine` chokepoint via a new `_apply_project_print_timeout()` helper and a new public `TransportRuntime.project_for_alias()` accessor (`src/untether/telegram/commands/executor.py`, `src/untether/transport_runtime.py`) so both the normal message path and the command-executor `run_one` path pick it up. New module `src/untether/telegram/print_timeout.py` (`handle_print_timeout_command`, `parse_duration`); routed in `loop.py` and added to the static command menu (always available, no section-enabled gate, modeled on `/model`); `printtimeout` reserved as a chat command id. Always writable, but a project whose engine isn't Antigravity still gets the value persisted with a note that it currently only affects Antigravity runs; degrades to a plain hint with no config write when used outside a project topic [#8](https://github.com/dnichyparuk/untether-agy/pull/8)
+
 ## v0.36.1 (2026-07-05)
 
 ### fixes

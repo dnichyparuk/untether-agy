@@ -158,6 +158,26 @@ def test_build_args_model_and_sandbox() -> None:
     assert args[args.index("--print-timeout") + 1] == "10m"
 
 
+def test_build_args_print_timeout_run_option_overrides_instance_default() -> None:
+    from untether.runners.run_options import EngineRunOptions, apply_run_options
+
+    runner = AntigravityRunner(print_timeout="10m")
+    with apply_run_options(EngineRunOptions(print_timeout="45m")):
+        args = runner.build_args("p", None, state=None)
+    assert args[args.index("--print-timeout") + 1] == "45m"
+
+
+def test_build_args_print_timeout_empty_run_option_falls_back_to_instance_default() -> (
+    None
+):
+    from untether.runners.run_options import EngineRunOptions, apply_run_options
+
+    runner = AntigravityRunner(print_timeout="10m")
+    with apply_run_options(EngineRunOptions(print_timeout="")):
+        args = runner.build_args("p", None, state=None)
+    assert args[args.index("--print-timeout") + 1] == "10m"
+
+
 def test_build_args_continue_and_conversation() -> None:
     runner = AntigravityRunner()
     cont = runner.build_args(

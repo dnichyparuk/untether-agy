@@ -214,6 +214,7 @@ class ProjectSettings(BaseModel):
     worktrees_dir: NonEmptyStr = ".worktrees"
     default_engine: NonEmptyStr | None = None
     worktree_base: NonEmptyStr | None = None
+    print_timeout: NonEmptyStr | None = None
     chat_id: StrictInt | None = None
 
 
@@ -646,6 +647,8 @@ class UntetherSettings(BaseSettings):
 
             worktree_base = entry.worktree_base
 
+            print_timeout = entry.print_timeout
+
             chat_id = entry.chat_id
             if chat_id is not None:
                 if chat_id == default_chat_id:
@@ -677,6 +680,7 @@ class UntetherSettings(BaseSettings):
                 worktrees_dir=worktrees_dir,
                 default_engine=default_engine,
                 worktree_base=worktree_base,
+                print_timeout=print_timeout,
                 chat_id=chat_id,
             )
 

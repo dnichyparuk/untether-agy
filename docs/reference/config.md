@@ -150,6 +150,7 @@ File size limits (not configurable):
 | `worktrees_dir` | string | `".worktrees"` | Worktree root (relative to `path` unless absolute). |
 | `default_engine` | string\|null | `null` | Per-project default engine. |
 | `worktree_base` | string\|null | `null` | Base branch for new worktrees. |
+| `print_timeout` | string\|null | `null` | Per-project Antigravity `--print-timeout` override; overrides the global `[antigravity] print_timeout`. Go duration syntax (e.g. `"30m"`). Only affects Antigravity (`agy`) runs. Settable from Telegram via `/printtimeout`. |
 | `chat_id` | int\|null | `null` | Bind a Telegram chat to this project. |
 
 Legacy config note: top-level `bot_token` / `chat_id` are auto-migrated into `[transports.telegram]` on startup.

@@ -62,6 +62,7 @@ from .engine_defaults import resolve_engine_for_message
 from .engine_overrides import merge_overrides
 from .listen_mode import resolve_listen_mode, should_trigger_run
 from .new_project import handle_project_command
+from .print_timeout import handle_print_timeout_command
 from .topic_state import TopicStateStore, resolve_state_path
 from .topics import (
     _maybe_rename_topic,
@@ -685,6 +686,21 @@ def _dispatch_builtin_command(
     if command_id == "model":
         handler = partial(
             handle_model_command,
+            cfg,
+            msg,
+            args_text,
+            ambient_context,
+            topic_store,
+            chat_prefs,
+            resolved_scope=resolved_scope,
+            scope_chat_ids=scope_chat_ids,
+        )
+        task_group.start_soon(handler)
+        return True
+
+    if command_id == "printtimeout":
+        handler = partial(
+            handle_print_timeout_command,
             cfg,
             msg,
             args_text,

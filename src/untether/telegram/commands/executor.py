@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -156,6 +157,30 @@ async def _send_runner_unavailable(
     )
 
 
+def _apply_project_print_timeout(
+    run_options: EngineRunOptions | None,
+    context: RunContext | None,
+    runtime: TransportRuntime,
+    *,
+    engine: EngineId | str | None,
+) -> EngineRunOptions | None:
+    """Apply a project-level ``print_timeout`` (antigravity only) onto run_options.
+
+    Only augments when the engine is ``antigravity``, a project is resolved
+    from ``context.project``, and that project defines ``print_timeout``. An
+    explicit caller-provided ``run_options.print_timeout`` always wins.
+    """
+    if engine != "antigravity" or context is None or context.project is None:
+        return run_options
+    project = runtime.project_for_alias(context.project)
+    if project is None or not project.print_timeout:
+        return run_options
+    if run_options is not None and run_options.print_timeout:
+        return run_options  # explicit override wins
+    base = run_options or EngineRunOptions()
+    return dataclasses.replace(base, print_timeout=project.print_timeout)
+
+
 async def _run_engine(
     *,
     exec_cfg: ExecBridgeConfig,
@@ -260,6 +285,9 @@ async def _run_engine(
                 text=text,
                 reply_to=reply_ref,
                 thread_id=thread_id,
+            )
+            run_options = _apply_project_print_timeout(
+                run_options, context, runtime, engine=runner.engine
             )
             with apply_run_options(run_options):
                 await handle_message(
