@@ -125,8 +125,6 @@ class TestHandlePrintTimeout:
             _msg("/printtimeout 30m"),
             args_text="30m",
             ambient_context=RunContext(project="foo"),
-            topic_store=None,
-            chat_prefs=None,
         )
 
         raw = read_config(config_path)
@@ -152,16 +150,12 @@ class TestHandlePrintTimeout:
             _msg("/printtimeout 45m"),
             args_text="45m",
             ambient_context=RunContext(project="foo"),
-            topic_store=None,
-            chat_prefs=None,
         )
         await handle_print_timeout_command(
             cfg,
             _msg("/printtimeout"),
             args_text="",
             ambient_context=RunContext(project="foo"),
-            topic_store=None,
-            chat_prefs=None,
         )
 
         text = _last_text(transport)
@@ -181,8 +175,6 @@ class TestHandlePrintTimeout:
             _msg("/printtimeout"),
             args_text="",
             ambient_context=RunContext(project="foo"),
-            topic_store=None,
-            chat_prefs=None,
         )
 
         text = _last_text(transport)
@@ -199,8 +191,6 @@ class TestHandlePrintTimeout:
             _msg("/printtimeout 30m"),
             args_text="30m",
             ambient_context=RunContext(project="foo"),
-            topic_store=None,
-            chat_prefs=None,
         )
         assert "print_timeout" in read_config(config_path)["projects"]["foo"]
 
@@ -209,8 +199,6 @@ class TestHandlePrintTimeout:
             _msg("/printtimeout clear"),
             args_text="clear",
             ambient_context=RunContext(project="foo"),
-            topic_store=None,
-            chat_prefs=None,
         )
 
         assert "print_timeout" not in read_config(config_path)["projects"]["foo"]
@@ -237,8 +225,6 @@ class TestHandlePrintTimeout:
             _msg("/printtimeout 30m"),
             args_text="30m",
             ambient_context=RunContext(project="foo"),
-            topic_store=None,
-            chat_prefs=None,
         )
         assert "print_timeout" not in read_config(config_path)["projects"]["foo"]
         assert "restricted to group admins" in _last_text(transport)
@@ -248,8 +234,6 @@ class TestHandlePrintTimeout:
             _msg("/printtimeout clear"),
             args_text="clear",
             ambient_context=RunContext(project="foo"),
-            topic_store=None,
-            chat_prefs=None,
         )
         assert "restricted to group admins" in _last_text(transport)
 
@@ -271,8 +255,6 @@ class TestHandlePrintTimeout:
             _msg("/printtimeout"),
             args_text="",
             ambient_context=RunContext(project="foo"),
-            topic_store=None,
-            chat_prefs=None,
         )
 
         text = _last_text(transport)
@@ -289,8 +271,6 @@ class TestHandlePrintTimeout:
             _msg("/printtimeout banana"),
             args_text="banana",
             ambient_context=RunContext(project="foo"),
-            topic_store=None,
-            chat_prefs=None,
         )
 
         text = _last_text(transport)
@@ -311,8 +291,6 @@ class TestHandlePrintTimeout:
             _msg("/printtimeout 30m"),
             args_text="30m",
             ambient_context=RunContext(project=None),
-            topic_store=None,
-            chat_prefs=None,
         )
 
         text = _last_text(transport)
@@ -331,8 +309,6 @@ class TestHandlePrintTimeout:
             _msg("/printtimeout 30m"),
             args_text="30m",
             ambient_context=None,
-            topic_store=None,
-            chat_prefs=None,
         )
 
         assert "⚠️" in _last_text(transport)
@@ -349,8 +325,6 @@ class TestHandlePrintTimeout:
             _msg("/printtimeout 30m"),
             args_text="30m",
             ambient_context=RunContext(project="bar"),
-            topic_store=None,
-            chat_prefs=None,
         )
 
         # Value is STILL written even though the engine isn't antigravity.
@@ -375,8 +349,6 @@ class TestHandlePrintTimeout:
             _msg("/printtimeout 30m"),
             args_text="30m",
             ambient_context=RunContext(project="foo"),
-            topic_store=None,
-            chat_prefs=None,
         )
 
         assert "failed to write config" in _last_text(transport)
@@ -396,11 +368,112 @@ class TestHandlePrintTimeout:
             _msg("/printtimeout 30m"),
             args_text="30m",
             ambient_context=RunContext(project="foo"),
-            topic_store=None,
-            chat_prefs=None,
         )
 
         assert "failed to set print_timeout" in _last_text(transport)
+
+    async def test_no_config_path_replies_gracefully(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg, transport, _ = _cfg(tmp_path, monkeypatch)
+        monkeypatch.setattr(cfg.runtime, "_config_path", None)
+
+        await handle_print_timeout_command(
+            cfg,
+            _msg("/printtimeout 30m"),
+            args_text="30m",
+            ambient_context=RunContext(project="foo"),
+        )
+
+        assert "no config path available" in _last_text(transport)
+
+    async def test_read_config_failure_replies_gracefully(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg, transport, _ = _cfg(tmp_path, monkeypatch)
+
+        def _boom(*_args, **_kwargs):
+            raise OSError("cannot read")
+
+        monkeypatch.setattr(pt_module, "read_config", _boom)
+
+        await handle_print_timeout_command(
+            cfg,
+            _msg("/printtimeout 30m"),
+            args_text="30m",
+            ambient_context=RunContext(project="foo"),
+        )
+
+        assert "failed to read config" in _last_text(transport)
+
+    async def test_persist_rejects_non_dict_projects_table(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg, transport, config_path = _cfg(tmp_path, monkeypatch)
+        # Corrupt the on-disk document so `_persist`'s own re-read sees a
+        # non-dict `projects` table, independent of the runtime's cached view.
+        # NOTE: must precede the `[transports.telegram]` header — a bare
+        # `key = value` line after a table header belongs to that table, not
+        # the document root.
+        config_path.write_text(
+            'projects = "not-a-table"\n' + _TELEGRAM_BASE, encoding="utf-8"
+        )
+
+        await handle_print_timeout_command(
+            cfg,
+            _msg("/printtimeout 30m"),
+            args_text="30m",
+            ambient_context=RunContext(project="foo"),
+        )
+
+        assert "failed to set print_timeout" in _last_text(transport)
+        assert "expected a table" in _last_text(transport)
+
+    async def test_persist_rejects_non_dict_project_entry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg, transport, config_path = _cfg(tmp_path, monkeypatch)
+        # Corrupt just the target alias's entry to a non-table value. Must
+        # precede any `[section]` header — see the sibling test above.
+        config_path.write_text(
+            'projects = { foo = "not-a-table" }\n'
+            + _TELEGRAM_BASE
+            + '\n[antigravity]\nprint_timeout = "20m"\n',
+            encoding="utf-8",
+        )
+
+        await handle_print_timeout_command(
+            cfg,
+            _msg("/printtimeout 30m"),
+            args_text="30m",
+            ambient_context=RunContext(project="foo"),
+        )
+
+        assert "failed to set print_timeout" in _last_text(transport)
+        assert "is not defined" in _last_text(transport)
+
+    async def test_show_reports_default_when_antigravity_section_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cfg, transport, config_path = _cfg(tmp_path, monkeypatch)
+        # No [antigravity] section at all — the common real-world case for a
+        # project that never configured a global override.
+        config_path.write_text(
+            _TELEGRAM_BASE + '\n[projects.foo]\npath = "foo"\n'
+            'default_engine = "antigravity"\n',
+            encoding="utf-8",
+        )
+
+        await handle_print_timeout_command(
+            cfg,
+            _msg("/printtimeout"),
+            args_text="",
+            ambient_context=RunContext(project="foo"),
+        )
+
+        text = _last_text(transport)
+        assert "15m" in text  # AntigravityRunner's built-in default
+        assert "no override set" in text
 
 
 # ── routing (_dispatch_builtin_command) ─────────────────────────────────────
@@ -422,11 +495,6 @@ class TestPrintTimeoutRouting:
             msg_arg,
             args_text_arg,
             ambient_context_arg,
-            topic_store_arg,
-            chat_prefs_arg,
-            *,
-            resolved_scope=None,
-            scope_chat_ids=None,
         ) -> None:
             calls.append(
                 {
@@ -434,10 +502,6 @@ class TestPrintTimeoutRouting:
                     "msg": msg_arg,
                     "args_text": args_text_arg,
                     "ambient_context": ambient_context_arg,
-                    "topic_store": topic_store_arg,
-                    "chat_prefs": chat_prefs_arg,
-                    "resolved_scope": resolved_scope,
-                    "scope_chat_ids": scope_chat_ids,
                 }
             )
 
@@ -470,8 +534,6 @@ class TestPrintTimeoutRouting:
         assert call["ambient_context"] is ambient_context
         assert call["ambient_context"].project == "foo"
         assert call["args_text"] == "30m"
-        assert call["resolved_scope"] == "all"
-        assert call["scope_chat_ids"] == frozenset({msg.chat_id})
 
 
 # ── menu (build_bot_commands) ────────────────────────────────────────────────

@@ -27,6 +27,7 @@ immediately resolvable without waiting on the config watcher.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..config import ConfigError, read_config, write_config
@@ -36,10 +37,8 @@ from ..runners.antigravity import _DEFAULT_PRINT_TIMEOUT
 from ..runners.antigravity import ENGINE as _ANTIGRAVITY_ENGINE
 from ..runtime_loader import build_runtime_spec
 from ..settings import validate_settings_data
-from .chat_prefs import ChatPrefsStore
 from .commands.overrides import require_admin_or_private
 from .commands.reply import make_reply
-from .topic_state import TopicStateStore
 from .types import TelegramIncomingMessage
 
 if TYPE_CHECKING:
@@ -84,11 +83,6 @@ async def handle_print_timeout_command(
     msg: TelegramIncomingMessage,
     args_text: str,
     ambient_context: RunContext | None,
-    topic_store: TopicStateStore | None,
-    chat_prefs: ChatPrefsStore | None,
-    *,
-    resolved_scope: str | None = None,
-    scope_chat_ids: frozenset[int] | None = None,
 ) -> None:
     """Orchestrate ``/printtimeout``: resolve project -> show / set / clear.
 
@@ -97,6 +91,11 @@ async def handle_print_timeout_command(
     validates and persists the duration, and the clear branch removes the
     project override — all via the same read -> validate -> write -> apply
     recipe used by ``register_project``.
+
+    Unlike ``/model``/``/agent`` (which also take ``topic_store``/``chat_prefs``
+    to resolve a per-topic/per-chat preference), this command's scope comes
+    entirely from ``ambient_context.project`` — it has no per-chat preference
+    store of its own, so those parameters are intentionally omitted here.
     """
     reply = make_reply(cfg, msg)
 
@@ -132,7 +131,6 @@ async def handle_print_timeout_command(
             global_default = candidate
 
     tokens = args_text.split()
-    action = tokens[0].lower() if tokens else "show"
     alias = project.alias
 
     # ── show ─────────────────────────────────────────────────────────────
@@ -161,7 +159,7 @@ async def handle_print_timeout_command(
         return
 
     # ── clear ────────────────────────────────────────────────────────────
-    if action == "clear":
+    if tokens[0].lower() == "clear":
         try:
             _persist(config_path, cfg, alias=alias, value=None)
         except ConfigError as exc:
@@ -216,7 +214,7 @@ async def handle_print_timeout_command(
 
 
 def _persist(
-    config_path,
+    config_path: Path,
     cfg: TelegramBridgeConfig,
     *,
     alias: str,

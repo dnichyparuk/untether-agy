@@ -705,10 +705,6 @@ def _dispatch_builtin_command(
             msg,
             args_text,
             ambient_context,
-            topic_store,
-            chat_prefs,
-            resolved_scope=resolved_scope,
-            scope_chat_ids=scope_chat_ids,
         )
         task_group.start_soon(handler)
         return True

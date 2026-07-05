@@ -6341,3 +6341,35 @@ class TestApplyProjectPrintTimeout:
         assert result is not None
         assert result.model == "x"
         assert result.print_timeout == "20m"
+
+    def test_none_context_leaves_run_options_unchanged(self) -> None:
+        from untether.runners.run_options import EngineRunOptions
+        from untether.telegram.commands.executor import (
+            _apply_project_print_timeout,
+        )
+
+        runtime = self._make_runtime(project=None)
+        run_options = EngineRunOptions(model="x")
+
+        result = _apply_project_print_timeout(
+            run_options, None, runtime, engine="antigravity"
+        )
+
+        assert result is run_options
+
+    def test_unresolved_alias_leaves_run_options_unchanged(self) -> None:
+        from untether.context import RunContext
+        from untether.runners.run_options import EngineRunOptions
+        from untether.telegram.commands.executor import (
+            _apply_project_print_timeout,
+        )
+
+        context = RunContext(project="unknown-alias")
+        runtime = self._make_runtime(project=None)
+        run_options = EngineRunOptions(model="x")
+
+        result = _apply_project_print_timeout(
+            run_options, context, runtime, engine="antigravity"
+        )
+
+        assert result is run_options

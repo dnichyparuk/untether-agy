@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import dataclasses
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Any, cast
 
@@ -24,6 +23,7 @@ from ...runner_bridge import (
 from ...runner_bridge import (
     IncomingMessage as RunnerIncomingMessage,
 )
+from ...runners.antigravity import ENGINE as _ANTIGRAVITY_ENGINE
 from ...runners.run_options import EngineRunOptions, apply_run_options
 from ...scheduler import ThreadScheduler
 from ...transport import MessageRef, RenderedMessage, SendOptions
@@ -170,7 +170,7 @@ def _apply_project_print_timeout(
     from ``context.project``, and that project defines ``print_timeout``. An
     explicit caller-provided ``run_options.print_timeout`` always wins.
     """
-    if engine != "antigravity" or context is None or context.project is None:
+    if engine != _ANTIGRAVITY_ENGINE or context is None or context.project is None:
         return run_options
     project = runtime.project_for_alias(context.project)
     if project is None or not project.print_timeout:
@@ -178,7 +178,7 @@ def _apply_project_print_timeout(
     if run_options is not None and run_options.print_timeout:
         return run_options  # explicit override wins
     base = run_options or EngineRunOptions()
-    return dataclasses.replace(base, print_timeout=project.print_timeout)
+    return replace(base, print_timeout=project.print_timeout)
 
 
 async def _run_engine(
