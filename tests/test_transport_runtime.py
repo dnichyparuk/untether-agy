@@ -161,3 +161,20 @@ def test_resolve_message_project_directive_clears_ambient_branch() -> None:
 
     assert resolved.context == RunContext(project="other", branch=None)
     assert resolved.context_source == "directives"
+
+
+def test_project_for_alias_returns_known_project() -> None:
+    runtime = _make_runtime()
+    project = runtime.project_for_alias("proj")
+    assert project is not None
+    assert project.alias == "proj"
+
+
+def test_project_for_alias_returns_none_for_unknown_alias() -> None:
+    runtime = _make_runtime()
+    assert runtime.project_for_alias("missing") is None
+
+
+def test_project_for_alias_returns_none_for_none_alias() -> None:
+    runtime = _make_runtime()
+    assert runtime.project_for_alias(None) is None

@@ -226,6 +226,12 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             return str(run_options.model)
         return self.model
 
+    def _resolved_print_timeout(self) -> str | None:
+        run_options = get_run_options()
+        if run_options is not None and run_options.print_timeout:
+            return str(run_options.print_timeout)
+        return self.print_timeout
+
     def build_args(
         self,
         prompt: str,
@@ -251,8 +257,9 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
             args.append("--sandbox")
         if self.auto_approve:
             args.append("--dangerously-skip-permissions")
-        if self.print_timeout:
-            args.extend(["--print-timeout", str(self.print_timeout)])
+        print_timeout = self._resolved_print_timeout()
+        if print_timeout:
+            args.extend(["--print-timeout", str(print_timeout)])
         for directory in self.add_dirs:
             args.extend(["--add-dir", str(directory)])
         args.extend(self.extra_args)

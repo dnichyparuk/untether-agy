@@ -85,6 +85,11 @@ via `extra_args` could silently contradict the configured permission stance.
   knob to raise the stall threshold to match. Setting `print_timeout = ""` restores agy's
   built-in `5m0s` (the flag is simply omitted).
   Tune via `[antigravity] print_timeout` (Go duration syntax).
+- **Per-project override precedence** — a project's `[projects.<alias>].print_timeout`
+  (settable from Telegram via `/printtimeout`) takes precedence over the global
+  `[antigravity] print_timeout` default, which in turn takes precedence over agy's own
+  built-in `5m0s`. Resolution happens per-run via the `EngineRunOptions` ContextVar (the
+  same channel `model` uses) — see `AntigravityRunner._resolved_print_timeout()`.
 - **No USD cost / budgets** — tokens only.
 - **Model footer may misreport** — the envelope has no `model` field and `agy` silently ignores
   an invalid `--model`; the footer reflects the *configured* model.

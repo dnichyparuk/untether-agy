@@ -78,6 +78,7 @@ def build_bot_commands(
         ("ctx", "show or update context"),
         ("agent", "set default engine"),
         ("model", "set model override"),
+        ("printtimeout", "set antigravity print-timeout for this project"),
         ("reasoning", "set reasoning override"),
         # #297: renamed from "trigger" → "listen". /trigger still works as
         # a deprecated alias but does not appear in the command menu.

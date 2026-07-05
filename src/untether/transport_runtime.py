@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from .config import ConfigError, ProjectsConfig
+from .config import ConfigError, ProjectConfig, ProjectsConfig
 from .context import RunContext
 from .directives import (
     ParsedDirectives,
@@ -317,3 +317,6 @@ class TransportRuntime:
 
     def format_context_line(self, context: RunContext | None) -> str | None:
         return format_context_line(context, projects=self._projects)
+
+    def project_for_alias(self, alias: str | None) -> ProjectConfig | None:
+        return self._projects.resolve(alias)

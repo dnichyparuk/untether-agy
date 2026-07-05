@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from untether import cli
@@ -153,3 +154,62 @@ def test_projects_relative_path_resolves(tmp_path: Path) -> None:
         reserved=RESERVED_CHAT_COMMANDS,
     )
     assert projects.projects["z80"].path == config_path.parent / "repo"
+
+
+def test_project_print_timeout_loads(tmp_path: Path) -> None:
+    config_path = tmp_path / "untether.toml"
+    settings = UntetherSettings.model_validate(
+        {
+            **_base_config(),
+            "projects": {"z80": {"path": "/tmp/repo", "print_timeout": "30m"}},
+        }
+    )
+    projects = settings.to_projects_config(
+        config_path=config_path,
+        engine_ids=["codex"],
+        reserved=RESERVED_CHAT_COMMANDS,
+    )
+    assert projects.projects["z80"].print_timeout == "30m"
+
+
+def test_project_print_timeout_defaults_to_none(tmp_path: Path) -> None:
+    config_path = tmp_path / "untether.toml"
+    settings = UntetherSettings.model_validate(
+        {**_base_config(), "projects": {"z80": {"path": "/tmp/repo"}}}
+    )
+    projects = settings.to_projects_config(
+        config_path=config_path,
+        engine_ids=["codex"],
+        reserved=RESERVED_CHAT_COMMANDS,
+    )
+    assert projects.projects["z80"].print_timeout is None
+
+
+def test_project_print_timeout_rejects_non_string() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        UntetherSettings.model_validate(
+            {
+                **_base_config(),
+                "projects": {"z80": {"path": "/tmp/repo", "print_timeout": 30}},
+            }
+        )
+
+
+def test_project_print_timeout_unknown_sibling_key_still_rejected() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        UntetherSettings.model_validate(
+            {
+                **_base_config(),
+                "projects": {
+                    "z80": {
+                        "path": "/tmp/repo",
+                        "print_timeout": "30m",
+                        "not_a_real_key": "oops",
+                    }
+                },
+            }
+        )
