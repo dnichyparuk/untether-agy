@@ -4024,6 +4024,49 @@ async def test_stall_threshold_elevated_with_active_children() -> None:
 
 
 @pytest.mark.anyio
+async def test_stall_threshold_elevated_for_antigravity() -> None:
+    """Antigravity uses its own 15-min-equivalent threshold, not the 5-min normal one.
+
+    Antigravity emits zero interim ActionEvents, so without an engine-specific
+    branch it would always fall to the "normal" threshold and warn on every
+    legitimate run longer than that (#print_timeout default bump follow-up).
+    """
+    transport = FakeTransport()
+    presenter = _KeyboardPresenter()
+    clock = _FakeClock(start=100.0)
+    edits = _make_edits(transport, presenter, clock=clock)
+    edits.tracker.engine = "antigravity"
+    edits._stall_check_interval = 0.01
+    edits._STALL_THRESHOLD_SECONDS = 0.05  # 50ms — "normal" threshold
+    edits._STALL_THRESHOLD_ANTIGRAVITY = 0.5  # 500ms
+    edits._stall_repeat_seconds = 0.02
+
+    async with anyio.create_task_group() as tg:
+
+        async def drive() -> None:
+            # Past the normal 50ms threshold but under the antigravity 500ms one.
+            clock.set(100.1)
+            await anyio.sleep(0.05)
+            edits.signal_send.close()
+
+        tg.start_soon(edits.run)
+        tg.start_soon(drive)
+
+    stall_msgs = [
+        c
+        for c in transport.send_calls
+        if "progress" in c["message"].text.lower()
+        or "stuck" in c["message"].text.lower()
+        or "waiting" in c["message"].text.lower()
+    ]
+    assert len(stall_msgs) == 0, (
+        f"Expected no stall warnings (under antigravity threshold), got: "
+        f"{[c['message'].text for c in stall_msgs]}"
+    )
+    assert edits._stall_warn_count == 0
+
+
+@pytest.mark.anyio
 async def test_stall_threshold_elevated_with_high_tcp() -> None:
     """When TCP count exceeds threshold, use subagent threshold even without child_pids."""
     from unittest.mock import patch

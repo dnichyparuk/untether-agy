@@ -64,7 +64,10 @@ _RESUME_RE = re.compile(
 # claude/codex reserved-flag guards). `--dangerously-skip-permissions` and
 # `--sandbox` are derived from the `auto_approve`/`sandbox` booleans, so allowing
 # them via extra_args would let a user silently re-enable full access even with
-# `auto_approve = false` — hence they are reserved.
+# `auto_approve = false` — hence they are reserved. `--print-timeout` is backed
+# by the dedicated `print_timeout` config key; allowing it via extra_args would
+# append a second `--print-timeout` after the runner's own, silently defeating
+# the configured default.
 _RESERVED_FLAGS: frozenset[str] = frozenset(
     {
         "-p",
@@ -77,6 +80,7 @@ _RESERVED_FLAGS: frozenset[str] = frozenset(
         "--model",
         "--dangerously-skip-permissions",
         "--sandbox",
+        "--print-timeout",
     }
 )
 
