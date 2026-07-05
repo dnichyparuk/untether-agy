@@ -453,6 +453,8 @@ def build_bot_commands(
     *,
     include_file: bool = True,
     include_topics: bool = False,
+    include_clone: bool = False,
+    include_new_project: bool = False,
 ):
     from .commands import build_bot_commands as _build
 
@@ -460,6 +462,8 @@ def build_bot_commands(
         runtime,
         include_file=include_file,
         include_topics=include_topics,
+        include_clone=include_clone,
+        include_new_project=include_new_project,
     )
 
 
