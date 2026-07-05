@@ -45,6 +45,11 @@ logger = get_logger(__name__)
 
 ENGINE: EngineId = "antigravity"
 
+# agy's own `--print-timeout` defaults to 5m0s, which silently kills long headless
+# runs. Untether raises it to a more generous default (overridable via
+# [antigravity] print_timeout) so long tasks aren't cut off mid-run. Go duration syntax.
+_DEFAULT_PRINT_TIMEOUT = "15m"
+
 # Max chars of a malformed stdout line surfaced to the user (full line is logged).
 _INVALID_JSON_EXCERPT = 500
 
@@ -197,7 +202,7 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
     model: str | None = None
     sandbox: bool = False
     auto_approve: bool = True
-    print_timeout: str | None = None
+    print_timeout: str | None = _DEFAULT_PRINT_TIMEOUT
     add_dirs: tuple[str, ...] = ()
     extra_args: tuple[str, ...] = ()
     session_title: str = "antigravity"
@@ -449,7 +454,7 @@ def build_runner(config: EngineConfig, config_path: Path) -> Runner:
             f"Invalid `antigravity.auto_approve` in {config_path}; expected a boolean."
         )
 
-    print_timeout = config.get("print_timeout")
+    print_timeout = config.get("print_timeout", _DEFAULT_PRINT_TIMEOUT)
     if print_timeout is not None and not isinstance(print_timeout, str):
         raise ConfigError(
             f"Invalid `antigravity.print_timeout` in {config_path}; expected a string."

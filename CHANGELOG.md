@@ -1,5 +1,11 @@
 # changelog
 
+## v0.36.1 (2026-07-05)
+
+### fixes
+
+- **fix:** long-running Antigravity (`agy`) tasks no longer time out at 5 minutes. `agy`'s own `--print-timeout` defaults to `5m0s`, and Untether left `[antigravity] print_timeout` unset — so any task running longer than 5 minutes was killed by `agy` and surfaced to Telegram as a "timeout". Untether's stall/liveness watchdogs can't govern antigravity (it emits a single terminal JSON envelope with no interim stdout, so they never fire), making agy's print-timeout the only effective limit. Untether now defaults `print_timeout` to `15m` (passing `--print-timeout 15m`), still overridable via `[antigravity] print_timeout` with Go duration syntax. Changed the dataclass default and `build_runner` fallback in `src/untether/runners/antigravity.py`; updated `docs/reference/runners/antigravity/runner.md` and `docs/reference/config.md`; added `test_build_runner_print_timeout_override` and default assertions in `tests/test_antigravity_runner.py` [#7](https://github.com/dnichyparuk/untether-agy/issues/7)
+
 ## v0.36.0 (2026-07-04)
 
 ### changes

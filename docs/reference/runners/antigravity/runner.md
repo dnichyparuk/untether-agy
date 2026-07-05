@@ -37,7 +37,7 @@ only). agy has no bidirectional control channel, so approval is decided at spawn
 | `--conversation <id>` | resume a specific conversation (id from a prior envelope) |
 | `--sandbox` | `[antigravity] sandbox = true` |
 | `--dangerously-skip-permissions` | `[antigravity] auto_approve = true` (default) — headless auto-approve |
-| `--print-timeout <dur>` | `[antigravity] print_timeout` (agy default `5m0s`) |
+| `--print-timeout <dur>` | `[antigravity] print_timeout` (Untether default `15m`, overrides agy's own `5m0s`) |
 | `--add-dir <path>` | repeated per `[antigravity] add_dirs` |
 
 The prompt is passed on argv; stdin is closed (`stdin_payload()` → `None`). No PTY is used.
@@ -51,7 +51,7 @@ inherit the full daemon environment.
 | `model` | string | none | `--model` |
 | `sandbox` | bool | `false` | `--sandbox` |
 | `auto_approve` | bool | `true` | `--dangerously-skip-permissions` |
-| `print_timeout` | string | none | `--print-timeout` |
+| `print_timeout` | string | `15m` | `--print-timeout` (overrides agy's own `5m0s`) |
 | `add_dirs` | list[string] | `[]` | `--add-dir` (repeated) |
 | `extra_args` | list[string] | `[]` | appended (Untether-managed flags rejected) |
 
@@ -73,6 +73,10 @@ via `extra_args` could silently contradict the configured permission stance.
 - **No live progress** — the envelope is terminal-only, so the Telegram message shows
   "working…" then the final answer. A long healthy run is stdout-silent; tune the `[watchdog]`
   expectations for this engine accordingly.
+- **agy's own print-timeout** — agy kills a headless run at its built-in `5m0s` by default.
+  Untether raises this to `15m` (`--print-timeout 15m`) so long tasks aren't cut off mid-run;
+  Untether's stall/liveness watchdogs are inert for a stdout-silent agy run, so this is the
+  only timeout that governs it. Tune via `[antigravity] print_timeout` (Go duration syntax).
 - **No USD cost / budgets** — tokens only.
 - **Model footer may misreport** — the envelope has no `model` field and `agy` silently ignores
   an invalid `--model`; the footer reflects the *configured* model.
