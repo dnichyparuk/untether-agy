@@ -1214,6 +1214,9 @@ class ProgressEdits:
             elif self._has_running_tool():
                 threshold = self._STALL_THRESHOLD_TOOL
                 threshold_reason = "running_tool"
+            elif getattr(self.tracker, "engine", None) == "antigravity":
+                threshold = self._STALL_THRESHOLD_ANTIGRAVITY
+                threshold_reason = "antigravity_no_progress"
             else:
                 threshold = self._STALL_THRESHOLD_SECONDS
                 threshold_reason = "normal"
@@ -2454,6 +2457,14 @@ class ProgressEdits:
     _STALL_THRESHOLD_TOOL: float = 600.0  # 10 minutes when a tool is actively running
     _STALL_THRESHOLD_MCP_TOOL: float = 900.0  # 15 min for MCP tools (network-bound)
     _STALL_THRESHOLD_SUBAGENT: float = 900.0  # 15 min for child process / subagent work
+    # Antigravity emits zero interim ActionEvents (single terminal JSON envelope),
+    # so it would otherwise always fall to the 5-min "normal" threshold and warn
+    # on every legitimate run longer than that. 15 min matches agy's own default
+    # `--print-timeout` (antigravity.py:_DEFAULT_PRINT_TIMEOUT) so a healthy run
+    # completes before the stall warning fires. A project/global override raising
+    # print_timeout beyond 15 min will still see a stall warning before agy's own
+    # timeout — documented limitation (docs/reference/runners/antigravity/runner.md).
+    _STALL_THRESHOLD_ANTIGRAVITY: float = 900.0  # 15 minutes
     # #526 rc20 follow-up: two-tier threshold for approval-pending stalls.
     # First reminder fires at 600 s so users get a reassuring "tap a button
     # above" message within the same window as a normal-tool stall (10 min)
