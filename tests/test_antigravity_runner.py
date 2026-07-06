@@ -212,6 +212,43 @@ def test_add_dirs_and_extra_args() -> None:
     assert "--foo" in args
 
 
+def _add_dir_values(args: list[str]) -> list[str]:
+    return [args[i + 1] for i, a in enumerate(args) if a == "--add-dir"]
+
+
+def test_build_args_injects_run_cwd_as_first_add_dir() -> None:
+    from untether.utils.paths import reset_run_base_dir, set_run_base_dir
+
+    runner = AntigravityRunner(add_dirs=("/a",))
+    token = set_run_base_dir(Path("/home/u/untether-projects/test03"))
+    try:
+        args = runner.build_args("p", None, state=None)
+    finally:
+        reset_run_base_dir(token)
+    # Project cwd is added first, ahead of the configured add_dirs.
+    assert _add_dir_values(args) == ["/home/u/untether-projects/test03", "/a"]
+
+
+def test_build_args_run_cwd_dedup_with_add_dirs() -> None:
+    from untether.utils.paths import reset_run_base_dir, set_run_base_dir
+
+    # An add_dirs entry equal to the run cwd must not be emitted twice.
+    runner = AntigravityRunner(add_dirs=("/proj", "/b"))
+    token = set_run_base_dir(Path("/proj"))
+    try:
+        args = runner.build_args("p", None, state=None)
+    finally:
+        reset_run_base_dir(token)
+    assert _add_dir_values(args) == ["/proj", "/b"]
+
+
+def test_build_args_no_run_cwd_no_injection() -> None:
+    # Default ContextVar (no set_run_base_dir) → no cwd --add-dir injected.
+    runner = AntigravityRunner()
+    args = runner.build_args("p", None, state=None)
+    assert "--add-dir" not in args
+
+
 # --- env ------------------------------------------------------------------
 
 def test_env_is_filtered() -> None:

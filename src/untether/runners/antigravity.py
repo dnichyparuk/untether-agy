@@ -39,6 +39,7 @@ from ..runner import (
     _stderr_excerpt,
 )
 from ..schemas import antigravity as antigravity_schema
+from ..utils.paths import get_run_base_dir
 from .run_options import get_run_options
 
 logger = get_logger(__name__)
@@ -260,8 +261,22 @@ class AntigravityRunner(ResumeTokenMixin, JsonlSubprocessRunner):
         print_timeout = self._resolved_print_timeout()
         if print_timeout:
             args.extend(["--print-timeout", str(print_timeout)])
+        # agy has no --cwd/--workspace flag and, run headlessly, does not
+        # reliably adopt its inherited process cwd as the workspace — it falls
+        # back to ~/.gemini/antigravity-cli/scratch. Inject the resolved run cwd
+        # (the project directory) as the first --add-dir so agy operates on the
+        # project's files. Configured add_dirs follow; duplicates are dropped so
+        # an add_dirs entry equal to the cwd isn't emitted twice.
+        add_dirs: list[str] = []
+        run_cwd = get_run_base_dir()
+        if run_cwd is not None:
+            add_dirs.append(str(run_cwd))
         for directory in self.add_dirs:
-            args.extend(["--add-dir", str(directory)])
+            directory = str(directory)
+            if directory not in add_dirs:
+                add_dirs.append(directory)
+        for directory in add_dirs:
+            args.extend(["--add-dir", directory])
         args.extend(self.extra_args)
         return args
 

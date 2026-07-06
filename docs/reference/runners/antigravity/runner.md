@@ -38,11 +38,28 @@ only). agy has no bidirectional control channel, so approval is decided at spawn
 | `--sandbox` | `[antigravity] sandbox = true` |
 | `--dangerously-skip-permissions` | `[antigravity] auto_approve = true` (default) — headless auto-approve |
 | `--print-timeout <dur>` | `[antigravity] print_timeout` (Untether default `15m`, overrides agy's own `5m0s`) |
-| `--add-dir <path>` | repeated per `[antigravity] add_dirs` |
+| `--add-dir <path>` | the resolved run cwd (project dir) is auto-added first, then one per `[antigravity] add_dirs` |
 
 The prompt is passed on argv; stdin is closed (`stdin_payload()` → `None`). No PTY is used.
 Environment is allowlist-filtered (`utils/env_policy.py`, #198) — the subprocess does not
 inherit the full daemon environment.
+
+### Working directory
+
+`agy` has no `--cwd`/`--workspace`/positional working-directory flag; its only directory
+lever is `--add-dir` ("Add a directory to the workspace, repeatable"). Run headlessly (`-p`),
+`agy` does **not** reliably adopt its inherited process cwd as the workspace — it falls back to
+`~/.gemini/antigravity-cli/scratch`, so files land outside the project. To pin `agy` to the
+project, `build_args` injects the resolved run cwd (`get_run_base_dir()` — the
+`[projects.<alias>].path` for the active topic) as the **first** `--add-dir`, ahead of any
+configured `add_dirs`; duplicates are dropped. When no run cwd is set (a run path that never
+called `set_run_base_dir`), only the configured `add_dirs` are passed.
+
+Caveat: if a project's `path` sits under a **dot-prefixed** ancestor directory (e.g. a
+`[new_project] root` like `~/.untether/projects`), `agy` rejects both the cwd and the
+`--add-dir` and falls back to scratch anyway — see upstream
+[antigravity-cli#20](https://github.com/google-antigravity/antigravity-cli/issues/20). Keep
+`[new_project] root` / `[clone] root` non-dotted.
 
 ## Configuration (`[antigravity]`)
 
@@ -52,7 +69,7 @@ inherit the full daemon environment.
 | `sandbox` | bool | `false` | `--sandbox` |
 | `auto_approve` | bool | `true` | `--dangerously-skip-permissions` |
 | `print_timeout` | string | `15m` | `--print-timeout` (overrides agy's own `5m0s`) |
-| `add_dirs` | list[string] | `[]` | `--add-dir` (repeated) |
+| `add_dirs` | list[string] | `[]` | extra `--add-dir` entries (the run cwd / project dir is auto-added first — see "Working directory") |
 | `extra_args` | list[string] | `[]` | appended (Untether-managed flags rejected) |
 
 Reserved flags (rejected in `extra_args`): `-p`, `--print`, `--prompt`, `--output-format`,
